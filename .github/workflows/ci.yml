@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  COBBLE_REF: main
+
+jobs:
+  build:
+    name: Format check and CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout cobble-spark
+        uses: actions/checkout@v5
+
+      - name: Checkout cobble branch
+        uses: actions/checkout@v5
+        with:
+          repository: cobble-project/cobble
+          ref: ${{ env.COBBLE_REF }}
+          path: cobble
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cobble-spark-cargo-registry-${{ hashFiles('cobble/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cobble-spark-cargo-registry-
+
+      - name: Cache cargo git
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cobble-spark-cargo-git-${{ hashFiles('cobble/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cobble-spark-cargo-git-
+
+      - name: Build and install cobble-java
+        run: ./scripts/install-local-cobble-java.sh cobble/cobble-java/java
+
+      - name: Check formatting
+        run: mvn --batch-mode --no-transfer-progress spotless:check
+
+      - name: Run CI
+        run: mvn --batch-mode --no-transfer-progress -Dspotless.check.skip=true verify
