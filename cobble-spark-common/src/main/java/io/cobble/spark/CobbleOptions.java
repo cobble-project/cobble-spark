@@ -31,7 +31,13 @@ public final class CobbleOptions {
     /** Number of retained global snapshots after each write commit. */
     public static final String SNAPSHOT_RETENTION = "snapshot.retention";
 
-    public static final int DEFAULT_SNAPSHOT_RETENTION = 1;
+    /**
+     * Snapshot cleanup is disabled by default: scans resolve a snapshot on the driver and release
+     * the coordinator before executors open cursors, so an aggressive retention could delete files
+     * a running query still needs. Enable with an explicit {@code snapshot.retention > 0} once
+     * snapshots are leased.
+     */
+    public static final int DEFAULT_SNAPSHOT_RETENTION = 0;
 
     /**
      * Number of writer tasks for a write job. Defaults to the Spark default parallelism, capped by
@@ -136,6 +142,23 @@ public final class CobbleOptions {
                     + writeTasks
                     + "}";
         }
+    }
+
+    /**
+     * Merges table-level properties (for example loaded from a catalog) with per-operation options
+     * (for example a scan's {@code snapshot-id}); operation options take precedence. The result is
+     * case-insensitive.
+     */
+    public static Map<String, String> mergeTableOptions(
+            Map<String, String> tableProperties, Map<String, String> operationOptions) {
+        Map<String, String> merged = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        if (tableProperties != null) {
+            merged.putAll(tableProperties);
+        }
+        if (operationOptions != null) {
+            merged.putAll(operationOptions);
+        }
+        return merged;
     }
 
     /** Parses raw option map into {@link CobbleTableConfig}, validating values. */

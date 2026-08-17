@@ -4,6 +4,7 @@ import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.ShardSnapshot;
 import io.cobble.SnapshotTools;
+import io.cobble.spark.CobbleCommitLock;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
@@ -24,7 +25,12 @@ public final class CobbleTableCommitter {
 
     private CobbleTableCommitter() {}
 
-    /** Commits all writer results and returns the materialized global snapshot. */
+    /**
+     * Commits all writer results and returns the materialized global snapshot.
+     *
+     * <p>The commit is serialized per table via {@link CobbleCommitLock}: the current snapshot id
+     * is re-read inside the lock so concurrent drivers cannot materialize the same id.
+     */
     public static GlobalSnapshot commit(
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema schema,
@@ -51,28 +57,35 @@ public final class CobbleTableCommitter {
         }
         validateCompleteCoverage(shardSnapshots, totalBuckets);
 
-        String defaultWriterPath = CobblePaths.tableRoot(config).getAbsolutePath();
-        Map<String, String> writerPathByDbId = CobblePaths.loadWriterPathIndex(config);
-        for (CobbleShardResult result : results) {
-            String writerPath = result.writerPath();
-            if (writerPath == null || writerPath.isEmpty()) {
-                writerPath = defaultWriterPath;
+        try (CobbleCommitLock ignored = CobbleCommitLock.acquire(config.pathUri())) {
+            String defaultWriterPath = CobblePaths.tableRoot(config).getAbsolutePath();
+            Map<String, String> writerPathByDbId = CobblePaths.loadWriterPathIndex(config);
+            for (CobbleShardResult result : results) {
+                String writerPath = result.writerPath();
+                if (writerPath == null || writerPath.isEmpty()) {
+                    writerPath = defaultWriterPath;
+                }
+                writerPathByDbId.put(result.shardSnapshot().dbId, writerPath);
             }
-            writerPathByDbId.put(result.shardSnapshot().dbId, writerPath);
-        }
-        CobblePaths.storeWriterPathIndex(config, writerPathByDbId);
+            CobblePaths.storeWriterPathIndex(config, writerPathByDbId);
 
-        try (DbCoordinator coordinator =
-                DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
-            GlobalSnapshot latest = coordinator.loadCurrentGlobalSnapshot();
-            long globalSnapshotId = latest == null ? 1L : latest.id + 1L;
-            GlobalSnapshot materialized =
-                    coordinator.materializeGlobalSnapshot(
-                            totalBuckets, globalSnapshotId, shardSnapshots);
-            CobbleTableSchema.store(config.pathUri(), globalSnapshotId, schema);
-            expireOlderSnapshots(
-                    config, schema, totalBuckets, coordinator, globalSnapshotId, writerPathByDbId);
-            return materialized;
+            try (DbCoordinator coordinator =
+                    DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
+                GlobalSnapshot latest = coordinator.loadCurrentGlobalSnapshot();
+                long globalSnapshotId = latest == null ? 1L : latest.id + 1L;
+                GlobalSnapshot materialized =
+                        coordinator.materializeGlobalSnapshot(
+                                totalBuckets, globalSnapshotId, shardSnapshots);
+                CobbleTableSchema.store(config.pathUri(), globalSnapshotId, schema);
+                expireOlderSnapshots(
+                        config,
+                        schema,
+                        totalBuckets,
+                        coordinator,
+                        globalSnapshotId,
+                        writerPathByDbId);
+                return materialized;
+            }
         }
     }
 
