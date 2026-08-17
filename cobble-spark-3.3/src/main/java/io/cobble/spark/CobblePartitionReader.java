@@ -139,7 +139,8 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
                             scanOptions);
         } catch (RuntimeException e) {
             closeQuietly();
-            throw new IOException("Failed to open Cobble scan cursor for split.", e);
+            throw new IOException(
+                    "Failed to open Cobble scan cursor for split: " + e.getMessage(), e);
         }
     }
 
