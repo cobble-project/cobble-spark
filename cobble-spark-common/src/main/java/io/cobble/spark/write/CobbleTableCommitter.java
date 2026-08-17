@@ -28,13 +28,17 @@ public final class CobbleTableCommitter {
     /**
      * Commits all writer results and returns the materialized global snapshot.
      *
-     * <p>The commit is serialized per table via {@link CobbleCommitLock}: the current snapshot id
-     * is re-read inside the lock so concurrent drivers cannot materialize the same id.
+     * <p>The commit is serialized per table via {@link CobbleCommitLock}. For appends, the writer
+     * tasks restore from {@code baseSnapshot} (pinned by the driver before they run); inside the
+     * lock the current snapshot is checked against that base, so a job that started from an
+     * already-superseded snapshot aborts instead of silently overwriting the newer commit.
      */
     public static GlobalSnapshot commit(
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema schema,
-            List<CobbleShardResult> results)
+            List<CobbleShardResult> results,
+            GlobalSnapshot baseSnapshot,
+            boolean overwrite)
             throws IOException {
         CobbleLoader.ensureCobbleLoaded();
         if (results.isEmpty()) {
@@ -58,20 +62,33 @@ public final class CobbleTableCommitter {
         validateCompleteCoverage(shardSnapshots, totalBuckets);
 
         try (CobbleCommitLock ignored = CobbleCommitLock.acquire(config.pathUri())) {
-            String defaultWriterPath = CobblePaths.tableRoot(config).getAbsolutePath();
-            Map<String, String> writerPathByDbId = CobblePaths.loadWriterPathIndex(config);
-            for (CobbleShardResult result : results) {
-                String writerPath = result.writerPath();
-                if (writerPath == null || writerPath.isEmpty()) {
-                    writerPath = defaultWriterPath;
-                }
-                writerPathByDbId.put(result.shardSnapshot().dbId, writerPath);
-            }
-            CobblePaths.storeWriterPathIndex(config, writerPathByDbId);
-
             try (DbCoordinator coordinator =
                     DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
+                // Check the expected base before touching any metadata: a stale base rejects the
+                // commit without publishing a snapshot or mutating the writer-path index.
                 GlobalSnapshot latest = coordinator.loadCurrentGlobalSnapshot();
+                if (!overwrite && !matchesBase(latest, baseSnapshot)) {
+                    throw new IOException(
+                            "Cobble table "
+                                    + config.pathUri()
+                                    + " was modified concurrently: expected base snapshot "
+                                    + describeSnapshot(baseSnapshot)
+                                    + " but the current snapshot is "
+                                    + describeSnapshot(latest)
+                                    + ". Retry the write.");
+                }
+
+                String defaultWriterPath = CobblePaths.tableRoot(config).getAbsolutePath();
+                Map<String, String> writerPathByDbId = CobblePaths.loadWriterPathIndex(config);
+                for (CobbleShardResult result : results) {
+                    String writerPath = result.writerPath();
+                    if (writerPath == null || writerPath.isEmpty()) {
+                        writerPath = defaultWriterPath;
+                    }
+                    writerPathByDbId.put(result.shardSnapshot().dbId, writerPath);
+                }
+                CobblePaths.storeWriterPathIndex(config, writerPathByDbId);
+
                 long globalSnapshotId = latest == null ? 1L : latest.id + 1L;
                 GlobalSnapshot materialized =
                         coordinator.materializeGlobalSnapshot(
@@ -87,6 +104,18 @@ public final class CobbleTableCommitter {
                 return materialized;
             }
         }
+    }
+
+    /** True when the current snapshot is still the base this append job started from. */
+    private static boolean matchesBase(GlobalSnapshot current, GlobalSnapshot expected) {
+        if (expected == null) {
+            return current == null;
+        }
+        return current != null && current.id == expected.id;
+    }
+
+    private static String describeSnapshot(GlobalSnapshot snapshot) {
+        return snapshot == null ? "none" : Long.toString(snapshot.id);
     }
 
     private static void validateCompleteCoverage(List<ShardSnapshot> snapshots, int totalBuckets)

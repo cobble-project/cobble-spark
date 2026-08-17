@@ -165,4 +165,15 @@ public class SparkCatalogTest {
                 Exception.class,
                 () -> spark.sql("CREATE TABLE cobble.db8.t8 (id INT, v STRING)" + " USING cobble"));
     }
+
+    @Test
+    public void emptyTableReadsZeroRows() {
+        spark.sql("CREATE DATABASE cobble.dbEmpty");
+        spark.sql(
+                "CREATE TABLE cobble.dbEmpty.t (id INT, v STRING) USING cobble"
+                        + " OPTIONS ('primary-key'='id')");
+        // No committed snapshot yet: a freshly created table reads as zero rows.
+        assertEquals(0, spark.sql("SELECT * FROM cobble.dbEmpty.t").count());
+        assertEquals(0, spark.read().table("cobble.dbEmpty.t").count());
+    }
 }

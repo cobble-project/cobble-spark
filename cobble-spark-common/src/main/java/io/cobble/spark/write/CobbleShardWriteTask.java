@@ -1,6 +1,5 @@
 package io.cobble.spark.write;
 
-import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.PendingSnapshot;
 import io.cobble.ShardSnapshot;
@@ -105,8 +104,9 @@ public final class CobbleShardWriteTask {
             CobbleWriteContext context, int writerIndex, int rangeStart, int rangeEnd)
             throws IOException {
         CobbleOptions.CobbleTableConfig config = context.config();
-        if (context.overwrite()) {
-            // Overwrite publishes a fresh snapshot chain and never restores prior state.
+        if (context.overwrite() || context.baseSnapshot() == null) {
+            // Overwrite publishes a fresh snapshot chain, and a brand new table has no prior
+            // state to restore; both never restore.
             return Db.open(
                     CobblePaths.createWriterConfig(
                             config,
@@ -117,30 +117,8 @@ public final class CobbleShardWriteTask {
                     rangeStart,
                     rangeEnd);
         }
-        GlobalSnapshot globalSnapshot = loadCurrentGlobalSnapshot(context);
-        if (globalSnapshot == null) {
-            return Db.open(
-                    CobblePaths.createWriterConfig(
-                            config,
-                            context.schema(),
-                            context.totalBuckets(),
-                            writerIndex,
-                            context.writerCount()),
-                    rangeStart,
-                    rangeEnd);
-        }
-        return restoreRescaledDb(context, writerIndex, globalSnapshot, rangeStart, rangeEnd);
-    }
-
-    private static GlobalSnapshot loadCurrentGlobalSnapshot(CobbleWriteContext context)
-            throws IOException {
-        CobbleLoader.ensureCobbleLoaded();
-        try (DbCoordinator coordinator =
-                DbCoordinator.open(
-                        CobblePaths.createCoordinatorConfig(
-                                context.config(), context.totalBuckets()))) {
-            return coordinator.loadCurrentGlobalSnapshot();
-        }
+        return restoreRescaledDb(
+                context, writerIndex, context.baseSnapshot(), rangeStart, rangeEnd);
     }
 
     private static Db restoreRescaledDb(

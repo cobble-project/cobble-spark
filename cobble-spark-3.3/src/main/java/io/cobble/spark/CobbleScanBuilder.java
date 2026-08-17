@@ -62,6 +62,11 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
                             ? coordinator.getGlobalSnapshot(config.snapshotId())
                             : coordinator.loadCurrentGlobalSnapshot();
             if (snapshot == null) {
+                if (!config.hasSnapshotId() && schema.totalBuckets > 0) {
+                    // The table exists (schema sidecar) but nothing has been committed yet: a
+                    // freshly created empty table reads as zero rows.
+                    return emptySnapshot(schema.totalBuckets);
+                }
                 throw new IllegalArgumentException(
                         "Cobble table "
                                 + name()
@@ -88,5 +93,14 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
             throw new IllegalStateException(
                     "Failed to resolve the Cobble snapshot for " + name(), e);
         }
+    }
+
+    /** An empty snapshot: no shards, so the scan plans zero partitions and returns zero rows. */
+    private static GlobalSnapshot emptySnapshot(int totalBuckets) {
+        GlobalSnapshot empty = new GlobalSnapshot();
+        empty.id = 0L;
+        empty.totalBuckets = totalBuckets;
+        empty.shardSnapshots = java.util.Collections.emptyList();
+        return empty;
     }
 }

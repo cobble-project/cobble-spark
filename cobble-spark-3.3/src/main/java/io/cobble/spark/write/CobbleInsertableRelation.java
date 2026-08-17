@@ -1,8 +1,10 @@
 package io.cobble.spark.write;
 
+import io.cobble.GlobalSnapshot;
 import io.cobble.spark.CobbleBucketMath;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
+import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleRowEncoder;
 import io.cobble.spark.CobbleTableSchema;
 
@@ -83,8 +85,17 @@ public final class CobbleInsertableRelation implements InsertableRelation {
             throw new IllegalStateException("Cobble writer count must be > 0.");
         }
 
+        // Pin the base snapshot on the driver before any task runs: every writer restores from it
+        // and the commit verifies (under the lock) that the table still points at it, so two jobs
+        // starting from the same snapshot cannot overwrite each other's commit.
+        GlobalSnapshot baseSnapshot = null;
+        if (!overwriteAll && CobbleTableSchema.sidecarExists(config.pathUri())) {
+            baseSnapshot = loadCurrentGlobalSnapshot(config);
+        }
+
         final CobbleWriteContext context =
-                new CobbleWriteContext(config, schema, totalBuckets, writerCount, overwriteAll);
+                new CobbleWriteContext(
+                        config, schema, totalBuckets, writerCount, overwriteAll, baseSnapshot);
         final CobbleRowEncoder encoder = new CobbleRowEncoder(schema);
         final String[] fieldNames = fieldNames(schema.toStructType());
         final int[] keyOrdinals = encoder.keyOrdinals(fieldNames);
@@ -117,9 +128,28 @@ public final class CobbleInsertableRelation implements InsertableRelation {
 
         List<CobbleShardResult> shardResults = results.collect();
         try {
-            CobbleTableCommitter.commit(config, schema, shardResults);
+            CobbleTableCommitter.commit(config, schema, shardResults, baseSnapshot, overwriteAll);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to commit the Cobble write.", e);
+        }
+    }
+
+    private static GlobalSnapshot loadCurrentGlobalSnapshot(
+            CobbleOptions.CobbleTableConfig config) {
+        io.cobble.DbCoordinator coordinator = null;
+        try {
+            coordinator =
+                    io.cobble.DbCoordinator.open(
+                            CobblePaths.createCoordinatorConfig(
+                                    config,
+                                    config.hasBucketCount()
+                                            ? Integer.valueOf(config.bucketCount())
+                                            : null));
+            return coordinator.loadCurrentGlobalSnapshot();
+        } finally {
+            if (coordinator != null) {
+                coordinator.close();
+            }
         }
     }
 

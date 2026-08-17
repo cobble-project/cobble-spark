@@ -35,6 +35,11 @@ import java.util.Properties;
  * under {@code <warehouse>/<database>/<table>}. A table directory contains the full table-level
  * properties ({@code cobble-table.properties}) plus the schema sidecar, so {@code CREATE TABLE},
  * {@code INSERT INTO} and {@code SELECT} work without repeating the {@code path} option.
+ *
+ * <p>Namespace and table names are validated and every resolved path is normalized and checked to
+ * stay under the warehouse, so hostile identifiers cannot escape it. Tables are managed: a
+ * user-supplied {@code path} option is overridden with the table directory, and {@code DROP TABLE}
+ * removes that directory.
  */
 public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
@@ -60,7 +65,8 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
                             + ".path=<warehouse>");
         }
         this.warehouse =
-                Paths.get(java.net.URI.create(CobbleOptions.normalizePathUri(warehouseValue)));
+                Paths.get(java.net.URI.create(CobbleOptions.normalizePathUri(warehouseValue)))
+                        .normalize();
         try {
             Files.createDirectories(warehouse);
         } catch (IOException e) {
@@ -112,11 +118,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     @Override
     public void createNamespace(String[] namespace, Map<String, String> metadata)
             throws NamespaceAlreadyExistsException {
-        if (namespace == null || namespace.length != 1) {
-            throw new IllegalArgumentException(
-                    "Cobble catalog supports single-level namespaces only, got "
-                            + (namespace == null ? "null" : String.join(".", namespace)));
-        }
         Path dir = namespaceDir(namespace);
         if (Files.exists(dir)) {
             throw new NamespaceAlreadyExistsException(namespace);
@@ -162,10 +163,11 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public boolean namespaceExists(String[] namespace) {
-        if (namespace == null || namespace.length != 1) {
+        try {
+            return Files.isDirectory(namespaceDir(namespace));
+        } catch (IllegalArgumentException e) {
             return false;
         }
-        return Files.isDirectory(namespaceDir(namespace));
     }
 
     @Override
@@ -187,9 +189,8 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public Table loadTable(Identifier ident) throws NoSuchTableException {
-        requireNamespace(ident);
-        File tableDir = tableDir(ident).toFile();
-        if (!tableDir.isDirectory()) {
+        Path tableDir = tableDir(ident);
+        if (!Files.isDirectory(tableDir)) {
             throw new NoSuchTableException(ident);
         }
         Map<String, String> properties = loadTableProperties(ident);
@@ -199,10 +200,11 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public boolean tableExists(Identifier ident) {
-        if (ident.namespace().length != 1) {
+        try {
+            return Files.isRegularFile(tableDir(ident).resolve(TABLE_PROPERTIES_FILE));
+        } catch (IllegalArgumentException e) {
             return false;
         }
-        return Files.isDirectory(tableDir(ident));
     }
 
     @Override
@@ -212,44 +214,56 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             Transform[] partitions,
             Map<String, String> properties)
             throws TableAlreadyExistsException, NoSuchNamespaceException {
-        requireNamespace(ident);
         Path tableDir = tableDir(ident);
         if (Files.exists(tableDir)) {
             throw new TableAlreadyExistsException(ident);
         }
-        String db = ident.namespace()[0];
-        try {
-            Files.createDirectories(tableDir);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to create table " + ident.name(), e);
-        }
+        String db = effectiveNamespace(ident)[0];
 
         Map<String, String> tableProperties = new HashMap<>();
         if (properties != null) {
             tableProperties.putAll(properties);
         }
         tableProperties.put(TableCatalog.PROP_PROVIDER, PROVIDER);
+        // Managed table: the path always points at the table directory, and DROP removes it.
         tableProperties.put(TableCatalog.PROP_LOCATION, tableDir.toUri().toString());
-        if (!tableProperties.containsKey(CobbleOptions.PATH)) {
-            tableProperties.put(CobbleOptions.PATH, tableDir.toUri().toString());
-        }
+        tableProperties.put(CobbleOptions.PATH, tableDir.toUri().toString());
+
+        // Validate everything before creating any directory, so a failed CREATE leaves nothing:
+        // schema, primary key, and the full option set (bucket range, retention, write.tasks,
+        // memory sizes, snapshot id).
         String rawPrimaryKey = tableProperties.get(CobbleOptions.PRIMARY_KEY);
         List<String> primaryKeys =
                 CobbleTableSchema.parsePrimaryKeyOption(rawPrimaryKey == null ? "" : rawPrimaryKey);
         // Spark SQL DDL columns default to nullable; primary key columns are implicitly NOT NULL.
         StructType effectiveSchema = forcePrimaryKeysNotNull(schema, primaryKeys);
+        CobbleTableSchema stored;
         try {
-            CobbleTableSchema stored =
-                    CobbleTableSchema.fromStructType(effectiveSchema, primaryKeys);
-            int buckets =
-                    tableProperties.containsKey(CobbleOptions.BUCKET)
-                            ? Integer.parseInt(tableProperties.get(CobbleOptions.BUCKET))
-                            : CobbleOptions.DEFAULT_BUCKET;
-            stored.totalBuckets = buckets;
+            stored = CobbleTableSchema.fromStructType(effectiveSchema, primaryKeys);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                    "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
+        }
+        CobbleOptions.CobbleTableConfig config;
+        try {
+            config = CobbleOptions.parse(tableProperties);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                    "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
+        }
+        stored.totalBuckets =
+                config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
+
+        try {
+            Files.createDirectories(tableDir);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to create table " + ident.name(), e);
+        }
+        try {
             storeTableProperties(tableDir, tableProperties);
             // Publish the schema sidecar now so the empty table is introspectable.
             CobbleTableSchema.store(tableDir.toUri().toString(), 0L, stored);
-        } catch (IOException | NumberFormatException e) {
+        } catch (IOException e) {
             try {
                 deleteRecursively(tableDir);
             } catch (IOException cleanup) {
@@ -264,7 +278,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
                             + e.getMessage(),
                     e);
         }
-        CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(tableProperties);
         return new CobbleTable(config, effectiveSchema, tableProperties);
     }
 
@@ -300,9 +313,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public boolean dropTable(Identifier ident) {
-        if (ident.namespace().length != 1) {
-            return false;
-        }
         Path tableDir = tableDir(ident);
         if (!Files.exists(tableDir)) {
             return false;
@@ -318,37 +328,73 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     @Override
     public void renameTable(Identifier oldIdent, Identifier newIdent)
             throws NoSuchTableException, TableAlreadyExistsException {
-        requireTableExists(stripCatalogPrefix(oldIdent));
+        requireTableExists(oldIdent);
         // Moving the table directory would break the absolute data file paths recorded inside the
         // committed snapshots, so renames are not supported yet.
         throw new UnsupportedOperationException(
                 "ALTER TABLE ... RENAME is not supported for the Cobble catalog yet.");
     }
 
-    private Identifier stripCatalogPrefix(Identifier ident) {
+    private Path namespaceDir(String[] namespace) {
+        if (namespace == null || namespace.length != 1) {
+            throw new IllegalArgumentException(
+                    "Cobble catalog supports single-level namespaces only, got "
+                            + (namespace == null ? "null" : String.join(".", namespace)));
+        }
+        requireValidName(namespace[0], "database");
+        return resolveUnderWarehouse(warehouse.resolve(namespace[0]));
+    }
+
+    private Path tableDir(Identifier ident) {
+        String[] namespace = effectiveNamespace(ident);
+        return resolveUnderWarehouse(warehouse.resolve(namespace[0]).resolve(ident.name()));
+    }
+
+    /** Strips an optional catalog-name namespace prefix and validates a single-level namespace. */
+    private String[] effectiveNamespace(Identifier ident) {
+        if (ident == null) {
+            throw new IllegalArgumentException("Cobble catalog identifier must not be null.");
+        }
         String[] namespace = ident.namespace();
         if (namespace.length > 1 && namespace[0].equals(name)) {
             String[] stripped = new String[namespace.length - 1];
             System.arraycopy(namespace, 1, stripped, 0, stripped.length);
-            return Identifier.of(stripped, ident.name());
+            namespace = stripped;
         }
-        return ident;
-    }
-
-    private Path namespaceDir(String[] namespace) {
-        return warehouse.resolve(namespace[0]);
-    }
-
-    private Path tableDir(Identifier ident) {
-        return warehouse.resolve(ident.namespace()[0]).resolve(ident.name());
-    }
-
-    private void requireNamespace(Identifier ident) {
-        if (ident == null || ident.namespace().length != 1) {
+        if (namespace.length != 1) {
             throw new IllegalArgumentException(
                     "Cobble catalog tables require a single database namespace, got "
-                            + (ident == null ? "null" : ident.toString()));
+                            + ident.toString());
         }
+        requireValidName(namespace[0], "database");
+        requireValidName(ident.name(), "table");
+        return namespace;
+    }
+
+    /** Rejects names that could escape the warehouse via path resolution. */
+    private static void requireValidName(String part, String what) {
+        if (part == null || part.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Cobble catalog " + what + " name must not be empty.");
+        }
+        if (part.equals(".") || part.equals("..")) {
+            throw new IllegalArgumentException(
+                    "Invalid Cobble catalog " + what + " name: '" + part + "'.");
+        }
+        if (part.indexOf('/') >= 0 || part.indexOf('\\') >= 0 || part.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException(
+                    "Invalid Cobble catalog " + what + " name: '" + part + "'.");
+        }
+    }
+
+    /** Normalizes and confirms the resolved path stays inside the warehouse. */
+    private Path resolveUnderWarehouse(Path resolved) {
+        Path normalized = resolved.normalize();
+        if (!normalized.startsWith(warehouse)) {
+            throw new IllegalArgumentException(
+                    "Cobble catalog path escapes the warehouse: " + resolved);
+        }
+        return normalized;
     }
 
     private void requireNoSuchNamespace(String[] namespace) throws NoSuchNamespaceException {

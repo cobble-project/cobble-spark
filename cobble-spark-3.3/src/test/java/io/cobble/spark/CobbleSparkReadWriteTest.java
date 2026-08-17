@@ -1,8 +1,15 @@
 package io.cobble.spark;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.cobble.DbCoordinator;
+import io.cobble.GlobalSnapshot;
+import io.cobble.ShardSnapshot;
+import io.cobble.spark.write.CobbleShardResult;
+import io.cobble.spark.write.CobbleTableCommitter;
 
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -15,6 +22,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.sql.Date;
@@ -22,6 +30,7 @@ import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /** End-to-end write/read tests against the real Cobble native engine on a local Spark session. */
 public class CobbleSparkReadWriteTest {
@@ -293,5 +302,75 @@ public class CobbleSparkReadWriteTest {
                                 .format("cobble")
                                 .option("path", tableDir.toUri().toString())
                                 .save());
+    }
+
+    /**
+     * Deterministic regression for the expected-base check: a job that started from an old snapshot
+     * must be rejected at commit time without publishing a snapshot or touching the writer-path
+     * index.
+     */
+    @Test
+    public void staleBaseCommitIsRejectedAndLeavesNoMetadata() throws Exception {
+        writeAndRead(Collections.singletonList(row(1, "v1", "1.00", null, null, 0d)), 4, 2);
+        writeAndRead(Collections.singletonList(row(2, "v2", "2.00", null, null, 0d)), 4, 2);
+
+        String pathUri = tableDir.toUri().toString();
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(Collections.singletonMap(CobbleOptions.PATH, pathUri));
+        CobbleTableSchema storedSchema = CobbleTableSchema.load(pathUri, null);
+        assertEquals(2L, loadCurrentSnapshot(config).id);
+
+        // The commit below claims to have been built on snapshot 1, which is already superseded.
+        GlobalSnapshot staleBase = loadSnapshot(config, 1L);
+        CobbleShardResult staleResult = produceShardResult(config, storedSchema, 4);
+
+        assertThrows(
+                IOException.class,
+                () ->
+                        CobbleTableCommitter.commit(
+                                config,
+                                storedSchema,
+                                Collections.singletonList(staleResult),
+                                staleBase,
+                                false));
+
+        // The current snapshot is unchanged and the rejected shard left no writer-path index entry.
+        assertEquals(2L, loadCurrentSnapshot(config).id);
+        Map<String, String> index = CobblePaths.loadWriterPathIndex(config);
+        assertFalse(index.containsKey(staleResult.shardSnapshot().dbId));
+    }
+
+    private static GlobalSnapshot loadSnapshot(CobbleOptions.CobbleTableConfig config, long id) {
+        try (DbCoordinator coordinator =
+                DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, 4))) {
+            return coordinator.getGlobalSnapshot(id);
+        }
+    }
+
+    private static GlobalSnapshot loadCurrentSnapshot(CobbleOptions.CobbleTableConfig config) {
+        try (DbCoordinator coordinator =
+                DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, 4))) {
+            return coordinator.loadCurrentGlobalSnapshot();
+        }
+    }
+
+    /** Opens a writer covering every bucket and returns its fresh shard snapshot as a result. */
+    private static CobbleShardResult produceShardResult(
+            CobbleOptions.CobbleTableConfig config,
+            CobbleTableSchema tableSchema,
+            int totalBuckets) {
+        io.cobble.structured.Db db =
+                io.cobble.structured.Db.open(
+                        CobblePaths.createWriterConfig(config, tableSchema, totalBuckets, 0, 1),
+                        0,
+                        totalBuckets - 1);
+        try {
+            db.put(0, new byte[] {1}, 0, new byte[] {42});
+            ShardSnapshot shard = db.snapshot();
+            return new CobbleShardResult(
+                    totalBuckets, 0, CobblePaths.tableRoot(config).getAbsolutePath(), shard);
+        } finally {
+            db.close();
+        }
     }
 }
