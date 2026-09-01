@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.cobble.table.BucketHash;
+
 import org.junit.jupiter.api.Test;
 
 /** Tests for bucket hashing and writer range math. */
@@ -12,10 +14,11 @@ public class CobbleBucketMathTest {
     @Test
     public void hashBucketIsStableAndBounded() {
         byte[] key = new byte[] {1, 2, 3};
-        assertEquals(CobbleBucketMath.hashBucket(key, 16), CobbleBucketMath.hashBucket(key, 16));
+        BucketHash hash = new BucketHash(16);
+        assertEquals(hash.bucket(key), hash.bucket(key));
         for (int i = 0; i < 100; i++) {
             byte[] probe = new byte[] {(byte) i, (byte) (i * 31), (byte) (i * 7)};
-            int bucket = CobbleBucketMath.hashBucket(probe, 16);
+            int bucket = hash.bucket(probe);
             assertTrue(bucket >= 0 && bucket < 16, "bucket out of range: " + bucket);
         }
     }
@@ -64,8 +67,7 @@ public class CobbleBucketMathTest {
 
     @Test
     public void rejectsInvalidArguments() {
-        assertThrows(
-                IllegalArgumentException.class, () -> CobbleBucketMath.hashBucket(new byte[1], 0));
+        assertThrows(IllegalArgumentException.class, () -> new BucketHash(0));
         assertThrows(
                 IllegalArgumentException.class, () -> CobbleBucketMath.writerRangeStart(0, 4, 8));
         assertThrows(

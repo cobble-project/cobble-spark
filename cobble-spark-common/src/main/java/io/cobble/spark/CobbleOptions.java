@@ -189,10 +189,10 @@ public final class CobbleOptions {
             String value = rawSnapshot.trim();
             if (!LATEST_SNAPSHOT.equalsIgnoreCase(value)) {
                 snapshotId = Long.valueOf(parseLongOption(SNAPSHOT_ID, value));
-                if (snapshotId.longValue() <= 0L) {
+                if (snapshotId.longValue() < 0L) {
                     throw new IllegalArgumentException(
                             SNAPSHOT_ID
-                                    + " must be a positive snapshot id or '"
+                                    + " must be a non-negative snapshot id or '"
                                     + LATEST_SNAPSHOT
                                     + "'.");
                 }

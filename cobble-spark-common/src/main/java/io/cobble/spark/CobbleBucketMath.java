@@ -1,7 +1,5 @@
 package io.cobble.spark;
 
-import java.util.Arrays;
-
 /**
  * Bucket assignment and writer range math shared by the read and write paths.
  *
@@ -12,14 +10,6 @@ import java.util.Arrays;
 public final class CobbleBucketMath {
 
     private CobbleBucketMath() {}
-
-    /** Hashes an encoded key into {@code [0, totalBuckets)}. */
-    public static int hashBucket(byte[] encodedKey, int totalBuckets) {
-        if (totalBuckets <= 0) {
-            throw new IllegalArgumentException("totalBuckets must be > 0");
-        }
-        return Math.floorMod(Arrays.hashCode(encodedKey), totalBuckets);
-    }
 
     /** Inclusive start bucket owned by writer {@code writerIndex}. */
     public static int writerRangeStart(int writerIndex, int totalBuckets, int writerCount) {

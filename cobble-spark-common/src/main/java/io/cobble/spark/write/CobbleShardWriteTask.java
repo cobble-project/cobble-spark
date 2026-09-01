@@ -1,5 +1,7 @@
 package io.cobble.spark.write;
 
+import io.cobble.Db;
+import io.cobble.ExpandStorageMode;
 import io.cobble.GlobalSnapshot;
 import io.cobble.PendingSnapshot;
 import io.cobble.ShardSnapshot;
@@ -7,10 +9,11 @@ import io.cobble.spark.CobbleBucketMath;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
-import io.cobble.spark.CobbleRowEncoder;
+import io.cobble.spark.CobbleSparkRowConverter;
+import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.spark.CobbleTableSchema;
-import io.cobble.structured.Db;
-import io.cobble.structured.ExpandStorageMode;
+import io.cobble.table.Table;
+import io.cobble.table.Value;
 
 import org.apache.spark.sql.Row;
 
@@ -48,36 +51,15 @@ public final class CobbleShardWriteTask {
         int rangeStart = CobbleBucketMath.writerRangeStart(writerIndex, totalBuckets, writerCount);
         int rangeEnd = CobbleBucketMath.writerRangeEnd(writerIndex, totalBuckets, writerCount);
 
-        CobbleRowEncoder encoder = new CobbleRowEncoder(schema);
-        String[] fieldNames = schema.fieldNames().toArray(new String[0]);
-        int[] keyOrdinals = encoder.keyOrdinals(fieldNames);
-        int[] valueOrdinals = encoder.valueOrdinals(fieldNames);
+        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
 
         Db db = openWriter(context, writerIndex, rangeStart, rangeEnd);
         try {
-            while (rows.hasNext()) {
-                Row row = rows.next();
-                byte[] key = encoder.encodeKey(row, keyOrdinals);
-                int bucket = CobbleBucketMath.hashBucket(key, totalBuckets);
-                if (bucket < rangeStart || bucket > rangeEnd) {
-                    throw new IOException(
-                            "Record bucket "
-                                    + bucket
-                                    + " is outside writer-owned range ["
-                                    + rangeStart
-                                    + ", "
-                                    + rangeEnd
-                                    + "] for writer "
-                                    + writerIndex
-                                    + ".");
-                }
-                for (int valueIndex = 0; valueIndex < valueOrdinals.length; valueIndex++) {
-                    byte[] value = encoder.encodeValue(row, valueOrdinals[valueIndex], valueIndex);
-                    if (value == null) {
-                        db.delete(bucket, key, valueIndex);
-                    } else {
-                        db.put(bucket, key, valueIndex, value);
-                    }
+            try (Table table =
+                    Table.create(db, CobbleTableRuntime.TABLE_NAME, schema.toTableSchema())) {
+                while (rows.hasNext()) {
+                    List<Value> values = converter.toValues(rows.next());
+                    table.put(values);
                 }
             }
             PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
@@ -109,11 +91,7 @@ public final class CobbleShardWriteTask {
             // state to restore; both never restore.
             return Db.open(
                     CobblePaths.createWriterConfig(
-                            config,
-                            context.schema(),
-                            context.totalBuckets(),
-                            writerIndex,
-                            context.writerCount()),
+                            config, context.totalBuckets(), writerIndex, context.writerCount()),
                     rangeStart,
                     rangeEnd);
         }
@@ -147,7 +125,6 @@ public final class CobbleShardWriteTask {
                 Db.restoreWithManifest(
                         CobblePaths.createWriterConfig(
                                 context.config(),
-                                context.schema(),
                                 context.totalBuckets(),
                                 writerIndex,
                                 context.writerCount()),
@@ -200,7 +177,6 @@ public final class CobbleShardWriteTask {
                 Db.restoreWithManifest(
                         CobblePaths.createWriterConfig(
                                 context.config(),
-                                context.schema(),
                                 context.totalBuckets(),
                                 writerIndex,
                                 context.writerCount()),

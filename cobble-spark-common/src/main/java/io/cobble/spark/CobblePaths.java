@@ -44,15 +44,13 @@ public final class CobblePaths {
      */
     public static Config createWriterConfig(
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
             int totalBuckets,
             int writerIndex,
             int writerCount) {
         File localDir = tableRoot(config);
         mkdirs(localDir);
 
-        Config dbConfig =
-                new Config().numColumns(schema.valueColumnCount()).totalBuckets(totalBuckets);
+        Config dbConfig = new Config().totalBuckets(totalBuckets);
         dbConfig.walEnabled = false;
         dbConfig.snapshotRetention = null;
         dbConfig.snapshotOnlyTrack = true;
@@ -139,12 +137,8 @@ public final class CobblePaths {
 
     /** Writer config scoped to an explicit writer path, used for snapshot pruning. */
     public static Config createWriterConfigForPath(
-            CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
-            int totalBuckets,
-            String writerPath) {
-        Config dbConfig =
-                new Config().numColumns(schema.valueColumnCount()).totalBuckets(totalBuckets);
+            CobbleOptions.CobbleTableConfig config, int totalBuckets, String writerPath) {
+        Config dbConfig = new Config().totalBuckets(totalBuckets);
         dbConfig.governanceMode = Config.GovernanceMode.NOOP;
         dbConfig.logConsole = false;
 
