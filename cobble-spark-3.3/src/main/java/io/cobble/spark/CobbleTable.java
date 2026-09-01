@@ -11,8 +11,8 @@ import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-import java.io.IOException;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -46,9 +46,8 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
 
     @Override
     public StructType schema() {
-        if (CobbleTableSchema.sidecarExists(config.pathUri())) {
-            return loadSchema(null).toStructType();
-        }
+        io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(config);
+        if (snapshot != null) return CobbleTableRuntime.loadSchema(config, snapshot).toStructType();
         if (providedSchema != null) {
             return providedSchema;
         }
@@ -72,8 +71,24 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
     @Override
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
         CobbleOptions.CobbleTableConfig scanConfig = operationConfig(options.asCaseSensitiveMap());
-        Long snapshotId = scanConfig.hasSnapshotId() ? Long.valueOf(scanConfig.snapshotId()) : null;
-        CobbleTableSchema schema = loadSchema(snapshotId);
+        io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(scanConfig);
+        CobbleTableSchema schema;
+        if (snapshot != null) {
+            schema = CobbleTableRuntime.loadSchema(scanConfig, snapshot);
+        } else if (providedSchema != null && !scanConfig.hasSnapshotId()) {
+            List<String> primaryKeys =
+                    CobbleTableSchema.parsePrimaryKeyOption(
+                            operationOptions(options.asCaseSensitiveMap())
+                                    .get(CobbleOptions.PRIMARY_KEY));
+            int totalBuckets =
+                    scanConfig.hasBucketCount()
+                            ? scanConfig.bucketCount()
+                            : CobbleOptions.DEFAULT_BUCKET;
+            schema = CobbleTableSchema.fromStructType(providedSchema, primaryKeys, totalBuckets);
+        } else {
+            throw new IllegalArgumentException(
+                    "Cobble table " + scanConfig.pathUri() + " has no committed snapshot.");
+        }
         return new CobbleScanBuilder(scanConfig, schema);
     }
 
@@ -93,29 +108,5 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
 
     private Map<String, String> operationOptions(Map<String, String> operationOptions) {
         return CobbleOptions.mergeTableOptions(tableProperties, operationOptions);
-    }
-
-    CobbleTableSchema loadSchema(Long snapshotId) {
-        try {
-            CobbleTableSchema schema = CobbleTableSchema.load(config.pathUri(), snapshotId);
-            if (snapshotId == null && config.hasBucketCount() && schema.totalBuckets > 0) {
-                if (schema.totalBuckets != config.bucketCount()) {
-                    throw new IllegalArgumentException(
-                            "Configured "
-                                    + CobbleOptions.BUCKET
-                                    + "="
-                                    + config.bucketCount()
-                                    + " does not match the stored bucket count "
-                                    + schema.totalBuckets
-                                    + " of table "
-                                    + config.pathUri()
-                                    + ".");
-                }
-            }
-            return schema;
-        } catch (IOException e) {
-            throw new IllegalStateException(
-                    "Failed to load the Cobble schema sidecar for " + config.pathUri(), e);
-        }
     }
 }

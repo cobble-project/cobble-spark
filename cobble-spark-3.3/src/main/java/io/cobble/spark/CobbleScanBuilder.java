@@ -54,7 +54,7 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
     private GlobalSnapshot resolveSnapshot() {
         CobbleLoader.ensureCobbleLoaded();
         Integer expectedBuckets =
-                schema.totalBuckets > 0 ? Integer.valueOf(schema.totalBuckets) : null;
+                schema.totalBuckets() > 0 ? Integer.valueOf(schema.totalBuckets()) : null;
         try (DbCoordinator coordinator =
                 DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, expectedBuckets))) {
             GlobalSnapshot snapshot =
@@ -62,10 +62,9 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
                             ? coordinator.getGlobalSnapshot(config.snapshotId())
                             : coordinator.loadCurrentGlobalSnapshot();
             if (snapshot == null) {
-                if (!config.hasSnapshotId() && schema.totalBuckets > 0) {
-                    // The table exists (schema sidecar) but nothing has been committed yet: a
-                    // freshly created empty table reads as zero rows.
-                    return emptySnapshot(schema.totalBuckets);
+                if (!config.hasSnapshotId() && schema.totalBuckets() > 0) {
+                    // A catalog-created table has a semantic schema before its first commit.
+                    return emptySnapshot(schema.totalBuckets());
                 }
                 throw new IllegalArgumentException(
                         "Cobble table "

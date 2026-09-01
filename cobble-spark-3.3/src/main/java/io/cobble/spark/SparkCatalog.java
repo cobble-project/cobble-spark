@@ -33,8 +33,8 @@ import java.util.Properties;
  * <p>Register with {@code spark.sql.catalog.<name>=io.cobble.spark.SparkCatalog} and {@code
  * spark.sql.catalog.<name>.path=<warehouse>}. Each namespace is one directory and each table lives
  * under {@code <warehouse>/<database>/<table>}. A table directory contains the full table-level
- * properties ({@code cobble-table.properties}) plus the schema sidecar, so {@code CREATE TABLE},
- * {@code INSERT INTO} and {@code SELECT} work without repeating the {@code path} option.
+ * properties ({@code cobble-table.properties}), so {@code CREATE TABLE}, {@code INSERT INTO} and
+ * {@code SELECT} work without repeating the {@code path} option.
  *
  * <p>Namespace and table names are validated and every resolved path is normalized and checked to
  * stay under the warehouse, so hostile identifiers cannot escape it. Tables are managed: a
@@ -44,6 +44,7 @@ import java.util.Properties;
 public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     private static final String TABLE_PROPERTIES_FILE = "cobble-table.properties";
+    private static final String SPARK_SCHEMA_PROPERTY = "cobble.spark.schema-json";
     private static final String PROVIDER = "cobble";
 
     private String name;
@@ -195,7 +196,12 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         }
         Map<String, String> properties = loadTableProperties(ident);
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(properties);
-        return new CobbleTable(config, null, properties);
+        String schemaJson = properties.get(SPARK_SCHEMA_PROPERTY);
+        StructType providedSchema =
+                schemaJson == null
+                        ? null
+                        : (StructType) org.apache.spark.sql.types.DataType.fromJson(schemaJson);
+        return new CobbleTable(config, providedSchema, properties);
     }
 
     @Override
@@ -237,13 +243,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
                 CobbleTableSchema.parsePrimaryKeyOption(rawPrimaryKey == null ? "" : rawPrimaryKey);
         // Spark SQL DDL columns default to nullable; primary key columns are implicitly NOT NULL.
         StructType effectiveSchema = forcePrimaryKeysNotNull(schema, primaryKeys);
-        CobbleTableSchema stored;
-        try {
-            stored = CobbleTableSchema.fromStructType(effectiveSchema, primaryKeys);
-        } catch (IllegalArgumentException e) {
-            throw new IllegalArgumentException(
-                    "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
-        }
         CobbleOptions.CobbleTableConfig config;
         try {
             config = CobbleOptions.parse(tableProperties);
@@ -251,8 +250,16 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             throw new IllegalArgumentException(
                     "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
         }
-        stored.totalBuckets =
-                config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
+        try {
+            CobbleTableSchema.fromStructType(
+                    effectiveSchema,
+                    primaryKeys,
+                    config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                    "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
+        }
+        tableProperties.put(SPARK_SCHEMA_PROPERTY, effectiveSchema.json());
 
         try {
             Files.createDirectories(tableDir);
@@ -261,8 +268,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         }
         try {
             storeTableProperties(tableDir, tableProperties);
-            // Publish the schema sidecar now so the empty table is introspectable.
-            CobbleTableSchema.store(tableDir.toUri().toString(), 0L, stored);
         } catch (IOException e) {
             try {
                 deleteRecursively(tableDir);

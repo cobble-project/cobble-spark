@@ -7,9 +7,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
+import io.cobble.ReadOnlyDb;
 import io.cobble.ShardSnapshot;
 import io.cobble.spark.write.CobbleShardResult;
 import io.cobble.spark.write.CobbleTableCommitter;
+import io.cobble.table.ReadOnlyTable;
+import io.cobble.table.Table;
+import io.cobble.table.TableKey;
+import io.cobble.table.TableSnapshotCommitter;
+import io.cobble.table.Value;
 
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -29,6 +35,7 @@ import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -151,6 +158,10 @@ public class CobbleSparkReadWriteTest {
     public void timeTravelBySnapshotId() {
         List<Row> first = Collections.singletonList(row(1, "v1", "1.00", null, null, 0d));
         writeAndRead(first, 2, 1);
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(
+                        Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
+        long firstSnapshotId = loadCurrentSnapshot(config).id;
         List<Row> second = Collections.singletonList(row(1, "v2", "2.00", null, null, 0d));
         writeAndRead(second, 2, 1);
 
@@ -167,7 +178,7 @@ public class CobbleSparkReadWriteTest {
                 spark.read()
                         .format("cobble")
                         .option("path", tableDir.toUri().toString())
-                        .option("snapshot-id", "1")
+                        .option("snapshot-id", Long.toString(firstSnapshotId))
                         .load()
                         .orderBy(org.apache.spark.sql.functions.col("id"))
                         .collectAsList();
@@ -304,6 +315,121 @@ public class CobbleSparkReadWriteTest {
                                 .save());
     }
 
+    @Test
+    public void nativeTableWrittenLikeFlinkIsReadableBySpark() {
+        String pathUri = tableDir.toUri().toString();
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(Collections.singletonMap(CobbleOptions.PATH, pathUri));
+        CobbleTableSchema nativeSchema =
+                CobbleTableSchema.fromStructType(schema, Collections.singletonList("id"), 4);
+        ShardSnapshot shard;
+        try (io.cobble.Db db =
+                io.cobble.Db.open(CobblePaths.createWriterConfig(config, 4, 0, 1), 0, 3)) {
+            try (Table table =
+                    Table.create(db, CobbleTableRuntime.TABLE_NAME, nativeSchema.toTableSchema())) {
+                table.put(
+                        new CobbleSparkRowConverter(nativeSchema)
+                                .toValues(
+                                        row(
+                                                7,
+                                                "from-flink-format",
+                                                "12.34",
+                                                "2026-08-27",
+                                                "2026-08-27 12:34:56.123456",
+                                                9.5d)));
+            }
+            shard = db.snapshot();
+        }
+        try (TableSnapshotCommitter committer =
+                TableSnapshotCommitter.open(CobblePaths.createCoordinatorConfig(config, 4), 4, 1)) {
+            assertTrue(committer.commitBatch(0L, Collections.singletonList(shard)) != null);
+        }
+
+        Row read = spark.read().format("cobble").load(pathUri).collectAsList().get(0);
+        assertEquals(7, read.getInt(0));
+        assertEquals("from-flink-format", read.getString(1));
+        assertEquals(0, new BigDecimal("12.34").compareTo(read.getDecimal(2)));
+    }
+
+    @Test
+    public void sparkTableIsReadableThroughNativeTableApiUsedByFlink() {
+        writeAndRead(
+                Collections.singletonList(row(11, "from-spark", "88.00", null, null, 3.25d)), 4, 1);
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(
+                        Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
+        GlobalSnapshot snapshot = loadCurrentSnapshot(config);
+        ShardSnapshot shard = snapshot.shardSnapshots.get(0);
+        try (ReadOnlyDb db =
+                        ReadOnlyDb.open(
+                                CobblePaths.createScanConfig(config, 4, 5),
+                                shard.snapshotId,
+                                shard.dbId);
+                ReadOnlyTable table = ReadOnlyTable.open(db, CobbleTableRuntime.TABLE_NAME)) {
+            TableKey key = table.keyBuilder().push(Value.int32(11)).build();
+            List<Value> values = table.get(key);
+            assertEquals(Value.int32(11), values.get(0));
+            assertEquals(Value.string("from-spark"), values.get(1));
+        }
+    }
+
+    @Test
+    public void nestedTypesRoundTripThroughNativeCodecs() {
+        StructType nestedSchema =
+                DataTypes.createStructType(
+                        Arrays.asList(
+                                DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                                DataTypes.createStructField(
+                                        "items",
+                                        DataTypes.createArrayType(DataTypes.IntegerType, true),
+                                        true),
+                                DataTypes.createStructField(
+                                        "attrs",
+                                        DataTypes.createMapType(
+                                                DataTypes.StringType, DataTypes.LongType, true),
+                                        true),
+                                DataTypes.createStructField(
+                                        "profile",
+                                        DataTypes.createStructType(
+                                                Arrays.asList(
+                                                        DataTypes.createStructField(
+                                                                "label",
+                                                                DataTypes.StringType,
+                                                                true),
+                                                        DataTypes.createStructField(
+                                                                "scores",
+                                                                DataTypes.createArrayType(
+                                                                        DataTypes.DoubleType,
+                                                                        false),
+                                                                false))),
+                                        true)));
+        Map<String, Long> attrs = new LinkedHashMap<String, Long>();
+        attrs.put("a", 1L);
+        attrs.put("nullable", null);
+        Dataset<Row> data =
+                spark.createDataFrame(
+                        Collections.singletonList(
+                                RowFactory.create(
+                                        1,
+                                        Arrays.asList(3, null, 5),
+                                        attrs,
+                                        RowFactory.create("nested", Arrays.asList(1.5d, 2.5d)))),
+                        nestedSchema);
+        data.write()
+                .format("cobble")
+                .option("path", tableDir.toUri().toString())
+                .option("primary-key", "id")
+                .option("bucket", "4")
+                .save();
+
+        Row read = spark.read().format("cobble").load(tableDir.toUri().toString()).first();
+        assertEquals(Arrays.asList(3, null, 5), read.getList(1));
+        assertEquals(Long.valueOf(1L), read.<String, Long>getJavaMap(2).get("a"));
+        assertTrue(read.<String, Long>getJavaMap(2).containsKey("nullable"));
+        assertEquals("nested", read.getStruct(3).getString(0));
+        assertEquals(Arrays.asList(1.5d, 2.5d), read.getStruct(3).getList(1));
+    }
+
     /**
      * Deterministic regression for the expected-base check: a job that started from an old snapshot
      * must be rejected at commit time without publishing a snapshot or touching the writer-path
@@ -312,39 +438,29 @@ public class CobbleSparkReadWriteTest {
     @Test
     public void staleBaseCommitIsRejectedAndLeavesNoMetadata() throws Exception {
         writeAndRead(Collections.singletonList(row(1, "v1", "1.00", null, null, 0d)), 4, 2);
-        writeAndRead(Collections.singletonList(row(2, "v2", "2.00", null, null, 0d)), 4, 2);
-
         String pathUri = tableDir.toUri().toString();
         CobbleOptions.CobbleTableConfig config =
                 CobbleOptions.parse(Collections.singletonMap(CobbleOptions.PATH, pathUri));
-        CobbleTableSchema storedSchema = CobbleTableSchema.load(pathUri, null);
-        assertEquals(2L, loadCurrentSnapshot(config).id);
+        GlobalSnapshot staleBase = loadCurrentSnapshot(config);
+        writeAndRead(Collections.singletonList(row(2, "v2", "2.00", null, null, 0d)), 4, 2);
 
-        // The commit below claims to have been built on snapshot 1, which is already superseded.
-        GlobalSnapshot staleBase = loadSnapshot(config, 1L);
+        GlobalSnapshot current = loadCurrentSnapshot(config);
+        CobbleTableSchema storedSchema = CobbleTableRuntime.loadSchema(config, current);
+        assertTrue(current.id > staleBase.id);
+
+        // The commit below claims to have been built on the already superseded first snapshot.
         CobbleShardResult staleResult = produceShardResult(config, storedSchema, 4);
 
         assertThrows(
                 IOException.class,
                 () ->
                         CobbleTableCommitter.commit(
-                                config,
-                                storedSchema,
-                                Collections.singletonList(staleResult),
-                                staleBase,
-                                false));
+                                config, Collections.singletonList(staleResult), staleBase, false));
 
         // The current snapshot is unchanged and the rejected shard left no writer-path index entry.
-        assertEquals(2L, loadCurrentSnapshot(config).id);
+        assertEquals(current.id, loadCurrentSnapshot(config).id);
         Map<String, String> index = CobblePaths.loadWriterPathIndex(config);
         assertFalse(index.containsKey(staleResult.shardSnapshot().dbId));
-    }
-
-    private static GlobalSnapshot loadSnapshot(CobbleOptions.CobbleTableConfig config, long id) {
-        try (DbCoordinator coordinator =
-                DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, 4))) {
-            return coordinator.getGlobalSnapshot(id);
-        }
     }
 
     private static GlobalSnapshot loadCurrentSnapshot(CobbleOptions.CobbleTableConfig config) {
@@ -359,13 +475,23 @@ public class CobbleSparkReadWriteTest {
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema tableSchema,
             int totalBuckets) {
-        io.cobble.structured.Db db =
-                io.cobble.structured.Db.open(
-                        CobblePaths.createWriterConfig(config, tableSchema, totalBuckets, 0, 1),
+        io.cobble.Db db =
+                io.cobble.Db.open(
+                        CobblePaths.createWriterConfig(config, totalBuckets, 0, 1),
                         0,
                         totalBuckets - 1);
         try {
-            db.put(0, new byte[] {1}, 0, new byte[] {42});
+            try (Table table =
+                    Table.create(db, CobbleTableRuntime.TABLE_NAME, tableSchema.toTableSchema())) {
+                table.put(
+                        Arrays.asList(
+                                Value.int32(999),
+                                Value.nullValue(),
+                                Value.nullValue(),
+                                Value.nullValue(),
+                                Value.nullValue(),
+                                Value.float64(0d)));
+            }
             ShardSnapshot shard = db.snapshot();
             return new CobbleShardResult(
                     totalBuckets, 0, CobblePaths.tableRoot(config).getAbsolutePath(), shard);

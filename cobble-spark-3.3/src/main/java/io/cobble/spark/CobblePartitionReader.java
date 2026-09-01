@@ -3,6 +3,9 @@ package io.cobble.spark;
 import io.cobble.ScanCursor;
 import io.cobble.ScanOptions;
 import io.cobble.ScanSplit;
+import io.cobble.table.KeyCodec;
+import io.cobble.table.Value;
+import io.cobble.table.ValueCodec;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
@@ -11,6 +14,8 @@ import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.TreeSet;
 
 /**
@@ -25,14 +30,14 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
     private final CobbleOptions.CobbleTableConfig config;
     private final CobbleTableSchema schema;
     private final StructType requiredSchema;
-    private final CobbleRowDecoder decoder;
-
     // Projection mapping per required field: primary key slot (>= 0) or value column index (>= 0).
+    private final io.cobble.table.LogicalType[] fieldTypes;
     private final int[] fieldKeySlot;
     private final int[] fieldValueIndex;
     // Distinct value columns requested for the scan, ascending, and their entry positions.
     private final int[] requestedValueColumns;
     private final int[] positionByValueIndex;
+    private final boolean needsKey;
 
     private GenericInternalRow row;
     private ScanCursor cursor;
@@ -47,23 +52,29 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         this.config = config;
         this.schema = schema;
         this.requiredSchema = requiredSchema;
-        this.decoder = new CobbleRowDecoder(schema);
 
         StructField[] required = requiredSchema.fields();
+        this.fieldTypes = new io.cobble.table.LogicalType[required.length];
         this.fieldKeySlot = new int[required.length];
         this.fieldValueIndex = new int[required.length];
         TreeSet<Integer> requested = new TreeSet<>();
+        boolean projectedKey = false;
         for (int i = 0; i < required.length; i++) {
-            CobbleTableSchema.Column column = columnByName(required[i].name());
-            if (column.columnRole() == CobbleTableSchema.ColumnRole.KEY) {
-                fieldKeySlot[i] = schema.primaryKeys.indexOf(column.name);
+            int ordinal = schema.ordinalOf(required[i].name());
+            fieldTypes[i] = schema.logicalType(ordinal);
+            int keySlot = schema.keySlotForOrdinal(ordinal);
+            if (keySlot >= 0) {
+                projectedKey = true;
+                fieldKeySlot[i] = keySlot;
                 fieldValueIndex[i] = -1;
             } else {
                 fieldKeySlot[i] = -1;
-                fieldValueIndex[i] = column.valueIndex.intValue();
-                requested.add(column.valueIndex);
+                int valueIndex = schema.valueIndexForOrdinal(ordinal);
+                fieldValueIndex[i] = valueIndex;
+                requested.add(Integer.valueOf(valueIndex));
             }
         }
+        this.needsKey = projectedKey;
         if (requested.isEmpty()) {
             // The scan API requires at least one column; request column 0 and ignore it.
             requested.add(Integer.valueOf(0));
@@ -81,15 +92,6 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         }
     }
 
-    private CobbleTableSchema.Column columnByName(String name) {
-        for (CobbleTableSchema.Column column : schema.fields) {
-            if (column.name.equals(name)) {
-                return column;
-            }
-        }
-        throw new IllegalArgumentException("Unknown Cobble column '" + name + "'.");
-    }
-
     @Override
     public boolean next() throws IOException {
         if (cursor == null) {
@@ -102,11 +104,16 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         if (row == null) {
             row = new GenericInternalRow(requiredSchema.fields().length);
         }
-        byte[][] keyParts = decoder.splitKey(entry.key);
+        List<Value> keyValues =
+                needsKey
+                        ? KeyCodec.decode(schema.primaryKeyTypes(), ByteBuffer.wrap(entry.key))
+                        : java.util.Collections.emptyList();
         for (int i = 0; i < fieldKeySlot.length; i++) {
             Object value;
             if (fieldKeySlot[i] >= 0) {
-                value = decoder.decodeKeyField(keyParts, fieldKeySlot[i]);
+                value =
+                        CobbleSparkRowConverter.toSparkInternal(
+                                fieldTypes[i], keyValues.get(fieldKeySlot[i]));
             } else {
                 int valueIndex = fieldValueIndex[i];
                 int position = positionByValueIndex[valueIndex];
@@ -116,7 +123,10 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
                                     + valueIndex
                                     + " was not requested in the scan.");
                 }
-                value = decoder.decodeValue(entry.columns[position], valueIndex);
+                Value decoded =
+                        ValueCodec.decodeOwned(
+                                fieldTypes[i], ByteBuffer.wrap(entry.columns[position]));
+                value = CobbleSparkRowConverter.toSparkInternal(fieldTypes[i], decoded);
             }
             row.update(i, value);
         }
@@ -125,12 +135,14 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
 
     private void openCursor() throws IOException {
         CobbleLoader.ensureCobbleLoaded();
-        int totalBuckets = schema.totalBuckets;
+        int totalBuckets = schema.totalBuckets();
         if (totalBuckets <= 0) {
-            throw new IOException("Cobble schema sidecar has no bucket count.");
+            throw new IOException("Cobble native table schema has no bucket count.");
         }
         scanOptions =
-                ScanOptions.forColumns(requestedValueColumns).readAheadBytes(READ_AHEAD_BYTES);
+                ScanOptions.forColumns(requestedValueColumns)
+                        .columnFamily(CobbleTableRuntime.TABLE_NAME)
+                        .readAheadBytes(READ_AHEAD_BYTES);
         try {
             cursor =
                     split.openScannerWithOptions(

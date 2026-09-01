@@ -38,15 +38,10 @@ public final class CobbleDataSource
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(options.asCaseSensitiveMap());
-        if (!CobbleTableSchema.sidecarExists(config.pathUri())) {
-            return null;
-        }
-        try {
-            return CobbleTableSchema.load(config.pathUri(), null).toStructType();
-        } catch (java.io.IOException e) {
-            throw new IllegalArgumentException(
-                    "Failed to read the Cobble schema sidecar under " + config.pathUri(), e);
-        }
+        io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(config);
+        return snapshot == null
+                ? null
+                : CobbleTableRuntime.loadSchema(config, snapshot).toStructType();
     }
 
     @Override
@@ -62,8 +57,7 @@ public final class CobbleDataSource
 
     @Override
     public boolean supportsExternalMetadata() {
-        // Writing a not yet existing path table supplies the DataFrame schema here; the sidecar
-        // only exists after the first commit.
+        // Writing a not yet existing path table supplies the DataFrame schema here.
         return true;
     }
 
@@ -77,14 +71,14 @@ public final class CobbleDataSource
                 new HashMap<>(scala.collection.JavaConverters.mapAsJavaMap(parameters));
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(options);
 
-        if (mode.equals(SaveMode.ErrorIfExists)
-                && CobbleTableSchema.sidecarExists(config.pathUri())) {
+        boolean exists = CobbleTableRuntime.tableExists(config);
+        if (mode.equals(SaveMode.ErrorIfExists) && exists) {
             throw new IllegalArgumentException(
                     "Cobble table "
                             + config.pathUri()
                             + " already exists; use append or overwrite.");
         }
-        if (mode.equals(SaveMode.Ignore) && CobbleTableSchema.sidecarExists(config.pathUri())) {
+        if (mode.equals(SaveMode.Ignore) && exists) {
             return emptyRelation(sqlContext, data);
         }
 

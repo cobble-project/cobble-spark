@@ -5,7 +5,8 @@ import io.cobble.spark.CobbleBucketMath;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
-import io.cobble.spark.CobbleRowEncoder;
+import io.cobble.spark.CobbleSparkRowConverter;
+import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.spark.CobbleTableSchema;
 
 import org.apache.spark.Partitioner;
@@ -16,7 +17,6 @@ import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.sources.InsertableRelation;
-import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
@@ -53,13 +53,14 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         CobbleLoader.ensureCobbleLoaded();
         boolean overwriteAll = overwrite || this.overwrite;
 
+        GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
         CobbleTableSchema schema;
         int totalBuckets;
-        if (CobbleTableSchema.sidecarExists(config.pathUri())) {
-            schema = loadExistingSchema();
+        if (currentSnapshot != null) {
+            schema = CobbleTableRuntime.loadSchema(config, currentSnapshot);
             schema.validateWriteSchema(data.schema());
             validatePrimaryKeyOption(schema);
-            totalBuckets = schema.totalBuckets;
+            totalBuckets = schema.totalBuckets();
         } else {
             if (writeSchema == null) {
                 throw new IllegalArgumentException(
@@ -69,10 +70,9 @@ public final class CobbleInsertableRelation implements InsertableRelation {
             List<String> primaryKeys =
                     CobbleTableSchema.parsePrimaryKeyOption(
                             rawPrimaryKey == null ? "" : rawPrimaryKey);
-            schema = CobbleTableSchema.fromStructType(data.schema(), primaryKeys);
             totalBuckets =
                     config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
-            schema.totalBuckets = totalBuckets;
+            schema = CobbleTableSchema.fromStructType(data.schema(), primaryKeys, totalBuckets);
         }
 
         int writerCount =
@@ -89,16 +89,12 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         // and the commit verifies (under the lock) that the table still points at it, so two jobs
         // starting from the same snapshot cannot overwrite each other's commit.
         GlobalSnapshot baseSnapshot = null;
-        if (!overwriteAll && CobbleTableSchema.sidecarExists(config.pathUri())) {
-            baseSnapshot = loadCurrentGlobalSnapshot(config);
-        }
+        if (!overwriteAll) baseSnapshot = currentSnapshot;
 
         final CobbleWriteContext context =
                 new CobbleWriteContext(
                         config, schema, totalBuckets, writerCount, overwriteAll, baseSnapshot);
-        final CobbleRowEncoder encoder = new CobbleRowEncoder(schema);
-        final String[] fieldNames = fieldNames(schema.toStructType());
-        final int[] keyOrdinals = encoder.keyOrdinals(fieldNames);
+        final CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
         final int buckets = totalBuckets;
         final int writers = writerCount;
 
@@ -107,8 +103,7 @@ public final class CobbleInsertableRelation implements InsertableRelation {
                 rows.mapToPair(
                         (PairFunction<Row, Integer, Row>)
                                 row -> {
-                                    byte[] key = encoder.encodeKey(row, keyOrdinals);
-                                    int bucket = CobbleBucketMath.hashBucket(key, buckets);
+                                    int bucket = converter.bucket(row);
                                     int writerIndex =
                                             CobbleBucketMath.writerIndexForBucket(
                                                     bucket, buckets, writers);
@@ -128,7 +123,7 @@ public final class CobbleInsertableRelation implements InsertableRelation {
 
         List<CobbleShardResult> shardResults = results.collect();
         try {
-            CobbleTableCommitter.commit(config, schema, shardResults, baseSnapshot, overwriteAll);
+            CobbleTableCommitter.commit(config, shardResults, baseSnapshot, overwriteAll);
         } catch (IOException e) {
             throw new IllegalStateException("Failed to commit the Cobble write.", e);
         }
@@ -153,28 +148,6 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         }
     }
 
-    private CobbleTableSchema loadExistingSchema() {
-        try {
-            CobbleTableSchema schema = CobbleTableSchema.load(config.pathUri(), null);
-            if (config.hasBucketCount() && schema.totalBuckets != config.bucketCount()) {
-                throw new IllegalArgumentException(
-                        "Configured "
-                                + CobbleOptions.BUCKET
-                                + "="
-                                + config.bucketCount()
-                                + " does not match the stored bucket count "
-                                + schema.totalBuckets
-                                + " of table "
-                                + config.pathUri()
-                                + ".");
-            }
-            return schema;
-        } catch (IOException e) {
-            throw new IllegalStateException(
-                    "Failed to load the Cobble schema sidecar for " + config.pathUri(), e);
-        }
-    }
-
     /** Rejects a supplied primary key option that disagrees with the stored table schema. */
     private void validatePrimaryKeyOption(CobbleTableSchema schema) {
         String rawPrimaryKey = rawOptions.get(CobbleOptions.PRIMARY_KEY);
@@ -182,27 +155,18 @@ public final class CobbleInsertableRelation implements InsertableRelation {
             return;
         }
         List<String> provided = CobbleTableSchema.parsePrimaryKeyOption(rawPrimaryKey);
-        if (!provided.equals(schema.primaryKeys)) {
+        if (!provided.equals(schema.primaryKeys())) {
             throw new IllegalArgumentException(
                     "Configured "
                             + CobbleOptions.PRIMARY_KEY
                             + "="
                             + rawPrimaryKey
                             + " does not match the stored primary key "
-                            + schema.primaryKeys
+                            + schema.primaryKeys()
                             + " of table "
                             + config.pathUri()
                             + ".");
         }
-    }
-
-    private static String[] fieldNames(StructType schema) {
-        StructField[] fields = schema.fields();
-        String[] names = new String[fields.length];
-        for (int i = 0; i < fields.length; i++) {
-            names[i] = fields[i].name();
-        }
-        return names;
     }
 
     private static Iterator<Row> toRowIterator(Iterator<Tuple2<Integer, Row>> partition) {
