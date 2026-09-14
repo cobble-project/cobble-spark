@@ -59,7 +59,7 @@ jobs:
             ${{ runner.os }}-cobble-spark-cargo-git-
 
       - name: Build and install cobble-java
-        run: ./scripts/install-local-cobble-java.sh cobble/cobble-java/java
+        run: ./scripts/install-local-cobble-java.sh cobble/cobble-binding/cobble-java/java
 
       - name: Check formatting
         run: mvn --batch-mode --no-transfer-progress spotless:check
