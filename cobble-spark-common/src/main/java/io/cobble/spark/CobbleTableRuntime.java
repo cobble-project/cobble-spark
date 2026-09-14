@@ -22,7 +22,11 @@ public final class CobbleTableRuntime {
                             FileCatalog.open(catalogConfig(reference), reference.storageId());
                     CatalogTable table = catalog.loadTable(reference.identifier());
                     DbCoordinator coordinator = table.coordinator(runtimeConfig(config, null))) {
-                reference.validate(table);
+                if (config.hasSnapshotId()) {
+                    reference.validateTable(table);
+                } else {
+                    reference.validate(table);
+                }
                 return config.hasSnapshotId()
                         ? coordinator.getGlobalSnapshot(config.snapshotId())
                         : coordinator.loadCurrentGlobalSnapshot();
@@ -67,7 +71,11 @@ public final class CobbleTableRuntime {
                             table.readerBuilder(runtimeConfig(config, snapshot.totalBuckets))
                                     .globalSnapshot(snapshot.id)
                                     .open()) {
-                reference.validate(table);
+                if (config.hasSnapshotId()) {
+                    reference.validateTable(table);
+                } else {
+                    reference.validate(table);
+                }
                 return reader.scanPlan();
             }
         }

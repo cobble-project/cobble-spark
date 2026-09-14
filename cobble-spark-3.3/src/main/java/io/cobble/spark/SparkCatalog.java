@@ -211,6 +211,30 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     }
 
     @Override
+    public Table loadTable(Identifier ident, String version) throws NoSuchTableException {
+        final long snapshotId;
+        try {
+            snapshotId = Long.parseLong(version);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    "Cobble snapshot version must be a numeric snapshot id, got '" + version + "'.",
+                    e);
+        }
+        if (snapshotId < 0L) {
+            throw new IllegalArgumentException("Cobble snapshot version must not be negative.");
+        }
+        TableIdentifier identifier = nativeIdentifier(ident);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.tableExists(identifier)) {
+                throw new NoSuchTableException(ident);
+            }
+            try (CatalogTable table = catalog.loadTable(identifier)) {
+                return catalogTable(table, Long.valueOf(snapshotId));
+            }
+        }
+    }
+
+    @Override
     public boolean tableExists(Identifier ident) {
         try {
             try (FileCatalog catalog = openNativeCatalog()) {
@@ -361,6 +385,10 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     }
 
     private CobbleTable catalogTable(CatalogTable table) {
+        return catalogTable(table, null);
+    }
+
+    private CobbleTable catalogTable(CatalogTable table, Long snapshotId) {
         CobbleCatalogReference reference =
                 new CobbleCatalogReference(
                         warehouse.toUri().toString(),
@@ -375,6 +403,9 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         properties.put(CobbleOptions.PATH, warehouse.toUri().toString());
         properties.put(TableCatalog.PROP_PROVIDER, PROVIDER);
         properties.put(CobbleOptions.BUCKET, Integer.toString(defaultBuckets));
+        if (snapshotId != null) {
+            properties.put(CobbleOptions.SNAPSHOT_ID, Long.toString(snapshotId.longValue()));
+        }
         return new CobbleTable(
                 CobbleOptions.parse(properties).withCatalogReference(reference),
                 CobbleTableSchema.fromTableSchema(table.schema(), defaultBuckets).toStructType(),
@@ -419,9 +450,19 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public Table alterTable(Identifier ident, TableChange... changes) throws NoSuchTableException {
-        requireTableExists(ident);
-        throw new UnsupportedOperationException(
-                "ALTER TABLE is not supported for the Cobble catalog yet.");
+        TableIdentifier identifier = nativeIdentifier(ident);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.tableExists(identifier)) {
+                throw new NoSuchTableException(ident);
+            }
+            try (CatalogTable current = catalog.loadTable(identifier)) {
+                List<io.cobble.table.TableSchemaChange> nativeChanges =
+                        CobbleSchemaChanges.toNativeChanges(current.schema(), changes);
+                try (CatalogTable evolved = catalog.evolveSchema(identifier, nativeChanges)) {
+                    return catalogTable(evolved);
+                }
+            }
+        }
     }
 
     @Override

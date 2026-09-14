@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -24,6 +25,7 @@ import io.cobble.table.Value;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
@@ -328,6 +330,174 @@ public class SparkCatalogTest {
         assertEquals(current.id, CobbleTableRuntime.loadSnapshot(config).id);
     }
 
+    @Test
+    public void schemaEvolutionReadsPinnedSourceWithLatestFieldIdsAndHistoricalVersion()
+            throws Exception {
+        spark.sql("CREATE DATABASE cobble.evolve_read");
+        spark.sql(
+                "CREATE TABLE cobble.evolve_read.scores (id INT, old_name STRING, score INT) "
+                        + "USING cobble OPTIONS ('primary-key'='id')");
+        spark.sql("INSERT INTO cobble.evolve_read.scores VALUES (1, 'before', 7)");
+        long oldSnapshotId = currentSnapshotId("evolve_read", "scores");
+        SparkCatalog catalog = directCatalog();
+        CobbleTable historical =
+                (CobbleTable)
+                        catalog.loadTable(
+                                Identifier.of(new String[] {"evolve_read"}, "scores"),
+                                Long.toString(oldSnapshotId));
+        assertEquals(
+                Collections.singleton(
+                        org.apache.spark.sql.connector.catalog.TableCapability.BATCH_READ),
+                historical.capabilities());
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> historical.newWriteBuilder(logicalWriteInfo()).build());
+
+        // These catalog edits do not rewrite the snapshot. The reader must decode it using its
+        // source schema, then map field ids to the latest schema.
+        spark.sql("ALTER TABLE cobble.evolve_read.scores ADD COLUMNS (added STRING)");
+        // No write has occurred after ADD: the fixed old snapshot already exposes the new nullable
+        // field as null.
+        Row afterAdd =
+                spark.sql("SELECT old_name, added FROM cobble.evolve_read.scores WHERE id = 1")
+                        .first();
+        assertEquals("before", afterAdd.getString(0));
+        assertNull(afterAdd.get(1));
+        // Only the new key receives the added field. The old physical row must remain null.
+        spark.sql("INSERT INTO cobble.evolve_read.scores VALUES (2, 'before-two', 8, 'present')");
+        assertEquals(
+                "present",
+                spark.sql("SELECT added FROM cobble.evolve_read.scores WHERE id = 2")
+                        .first()
+                        .getString(0));
+
+        spark.sql("ALTER TABLE cobble.evolve_read.scores RENAME COLUMN old_name TO renamed");
+        assertEquals(
+                "before",
+                spark.sql("SELECT renamed FROM cobble.evolve_read.scores WHERE id = 1")
+                        .first()
+                        .getString(0));
+
+        spark.sql("ALTER TABLE cobble.evolve_read.scores ALTER COLUMN score TYPE BIGINT");
+        assertEquals(
+                7L,
+                spark.sql("SELECT score FROM cobble.evolve_read.scores WHERE id = 1")
+                        .first()
+                        .getLong(0));
+
+        // A retired id must not leak into a later column that reuses its name.
+        spark.sql("ALTER TABLE cobble.evolve_read.scores DROP COLUMN renamed");
+        spark.sql("ALTER TABLE cobble.evolve_read.scores ADD COLUMNS (renamed STRING)");
+        assertNull(
+                spark.sql("SELECT renamed FROM cobble.evolve_read.scores WHERE id = 1")
+                        .first()
+                        .get(0));
+
+        // Exercise the native 2 -> 1 -> 3 writer recovery chain against the evolved catalog
+        // schema. Each catalog alias creates its own writer task count over the same table.
+        configureCatalogAlias("cobble_one", 1);
+        spark.sql("INSERT INTO cobble_one.evolve_read.scores VALUES (3, 9L, 'three', 'new-three')");
+        configureCatalogAlias("cobble_three", 3);
+        spark.sql(
+                "INSERT INTO cobble_three.evolve_read.scores VALUES (4, 10L, 'four', 'new-four')");
+        List<Row> latest =
+                spark.sql(
+                                "SELECT id, score, added, renamed FROM cobble.evolve_read.scores "
+                                        + "ORDER BY id")
+                        .collectAsList();
+        assertEquals(4, latest.size());
+        assertEquals(7L, latest.get(0).getLong(1));
+        assertNull(latest.get(0).get(2));
+        assertNull(latest.get(0).get(3));
+        assertEquals("present", latest.get(1).getString(2));
+        assertNull(latest.get(1).get(3));
+        assertEquals("new-three", latest.get(2).getString(3));
+        assertEquals("new-four", latest.get(3).getString(3));
+
+        assertEquals(
+                Arrays.asList("id", "old_name", "score"),
+                Arrays.asList(historical.schema().fieldNames()));
+        assertEquals("before", firstString(historical, 1));
+    }
+
+    @Test
+    public void unsupportedAlterBatchDoesNotPartiallyUpdateNativeSchema() throws Exception {
+        SparkCatalog catalog = directCatalog();
+        String[] namespace = new String[] {"evolve_atomic"};
+        catalog.createNamespace(namespace, Collections.emptyMap());
+        Identifier identifier = Identifier.of(namespace, "scores");
+        catalog.createTable(
+                identifier,
+                sparkSchema(),
+                new org.apache.spark.sql.connector.expressions.Transform[0],
+                primaryKeyProperties());
+        long schemaId = nativeCatalogSchemaId("evolve_atomic", "scores");
+
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        catalog.alterTable(
+                                identifier,
+                                TableChange.addColumn(
+                                        new String[] {"would_have_been_added"},
+                                        DataTypes.StringType,
+                                        true),
+                                TableChange.addColumn(
+                                        new String[] {"nested", "child"},
+                                        DataTypes.StringType,
+                                        true)));
+        assertEquals(schemaId, nativeCatalogSchemaId("evolve_atomic", "scores"));
+        try (FileCatalog nativeCatalog = openNativeCatalog();
+                CatalogTable table =
+                        nativeCatalog.loadTable(nativeIdentifier("evolve_atomic", "scores"))) {
+            assertEquals(
+                    Arrays.asList("id", "v"),
+                    table.schema().fields().stream()
+                            .map(io.cobble.table.DataField::name)
+                            .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
+    @Test
+    public void catalogAlterBatchWithNarrowingLeavesNativeSchemaUntouched() throws Exception {
+        String[] namespace = new String[] {"evolve_native_atomic"};
+        Identifier identifier = Identifier.of(namespace, "scores");
+        StructType schema =
+                DataTypes.createStructType(
+                        new org.apache.spark.sql.types.StructField[] {
+                            DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                            DataTypes.createStructField("score", DataTypes.IntegerType, true)
+                        });
+        SparkCatalog catalog = directCatalog();
+        catalog.createNamespace(namespace, Collections.emptyMap());
+        catalog.createTable(
+                identifier,
+                schema,
+                new org.apache.spark.sql.connector.expressions.Transform[0],
+                primaryKeyProperties());
+        long schemaId = nativeCatalogSchemaId("evolve_native_atomic", "scores");
+        assertThrows(
+                RuntimeException.class,
+                () ->
+                        catalog.alterTable(
+                                identifier,
+                                TableChange.addColumn(
+                                        new String[] {"valid_prefix"}, DataTypes.StringType, true),
+                                TableChange.updateColumnType(
+                                        new String[] {"score"}, DataTypes.ByteType)));
+        try (FileCatalog nativeCatalog = openNativeCatalog();
+                CatalogTable unchanged =
+                        nativeCatalog.loadTable(
+                                nativeIdentifier("evolve_native_atomic", "scores"))) {
+            assertEquals(schemaId, unchanged.catalogSchemaId());
+            assertEquals(
+                    Arrays.asList("id", "score"),
+                    unchanged.schema().fields().stream()
+                            .map(io.cobble.table.DataField::name)
+                            .collect(java.util.stream.Collectors.toList()));
+        }
+    }
+
     private static Config nativeRuntime() {
         return new Config().addVolume(warehouse.toUri().toString()).totalBuckets(4);
     }
@@ -373,6 +543,49 @@ public class SparkCatalogTest {
                 CatalogTable nativeTable = catalog.loadTable(nativeIdentifier(namespace, table))) {
             return nativeTable.tableId();
         }
+    }
+
+    private static long nativeCatalogSchemaId(String namespace, String table) {
+        try (FileCatalog catalog = openNativeCatalog();
+                CatalogTable nativeTable = catalog.loadTable(nativeIdentifier(namespace, table))) {
+            return nativeTable.catalogSchemaId();
+        }
+    }
+
+    private static long currentSnapshotId(String namespace, String table) {
+        try (FileCatalog catalog = openNativeCatalog();
+                CatalogTable nativeTable = catalog.loadTable(nativeIdentifier(namespace, table));
+                DbCoordinator coordinator = nativeTable.coordinator(nativeRuntime())) {
+            return coordinator.loadCurrentGlobalSnapshot().id;
+        }
+    }
+
+    private static void configureCatalogAlias(String alias, int writerCount) {
+        spark.conf().set("spark.sql.catalog." + alias, SparkCatalog.class.getName());
+        spark.conf().set("spark.sql.catalog." + alias + ".path", warehouse.toUri().toString());
+        spark.conf().set("spark.sql.catalog." + alias + ".bucket", "4");
+        spark.conf()
+                .set("spark.sql.catalog." + alias + ".write.tasks", Integer.toString(writerCount));
+    }
+
+    private static String firstString(CobbleTable table, int ordinal) throws Exception {
+        org.apache.spark.sql.connector.read.Batch batch =
+                table.newScanBuilder(new CaseInsensitiveStringMap(Collections.emptyMap()))
+                        .build()
+                        .toBatch();
+        org.apache.spark.sql.connector.read.PartitionReaderFactory factory =
+                batch.createReaderFactory();
+        for (org.apache.spark.sql.connector.read.InputPartition partition :
+                batch.planInputPartitions()) {
+            try (org.apache.spark.sql.connector.read.PartitionReader<
+                            org.apache.spark.sql.catalyst.InternalRow>
+                    reader = factory.createReader(partition)) {
+                if (reader.next()) {
+                    return reader.get().getUTF8String(ordinal).toString();
+                }
+            }
+        }
+        throw new AssertionError("Historical Cobble table had no rows.");
     }
 
     private static LogicalWriteInfo logicalWriteInfo() {

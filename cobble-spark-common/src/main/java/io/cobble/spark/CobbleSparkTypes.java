@@ -7,6 +7,7 @@ import io.cobble.table.LogicalType;
 import io.cobble.table.LogicalTypes;
 import io.cobble.table.RecordType;
 import io.cobble.table.TimestampKind;
+import io.cobble.table.TimestampType;
 
 import org.apache.spark.sql.types.ArrayType;
 import org.apache.spark.sql.types.DataType;
@@ -103,6 +104,17 @@ public final class CobbleSparkTypes {
             case DATE:
                 return DataTypes.DateType;
             case TIMESTAMP:
+                TimestampType timestamp = (TimestampType) type;
+                if (timestamp.timestampKind() != TimestampKind.WITH_LOCAL_TIME_ZONE
+                        || timestamp.precision() > 6) {
+                    throw new IllegalArgumentException(
+                            "Cobble TIMESTAMP requires WITH_LOCAL_TIME_ZONE and precision <= 6 "
+                                    + "for Spark 3.3; got "
+                                    + timestamp.timestampKind()
+                                    + "("
+                                    + timestamp.precision()
+                                    + ").");
+                }
                 return DataTypes.TimestampType;
             case STRING:
                 return DataTypes.StringType;

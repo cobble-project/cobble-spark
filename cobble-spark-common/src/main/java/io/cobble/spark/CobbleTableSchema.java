@@ -133,6 +133,17 @@ public final class CobbleTableSchema implements Serializable {
         throw new IllegalArgumentException("Unknown Cobble column '" + columnName + "'.");
     }
 
+    /** Returns the stable native field id for a Spark-schema ordinal. */
+    public long fieldId(int ordinal) {
+        return toTableSchema().fields().get(ordinal).id();
+    }
+
+    /** Returns the active schema ordinal for a stable native field id, or {@code -1} if retired. */
+    public int ordinalForFieldId(long fieldId) {
+        Integer ordinal = positionsById().get(Long.valueOf(fieldId));
+        return ordinal == null ? -1 : ordinal.intValue();
+    }
+
     public int[] keyOrdinals() {
         int[] ordinals = new int[primaryKeys.size()];
         for (int i = 0; i < ordinals.length; i++) ordinals[i] = ordinalOf(primaryKeys.get(i));
@@ -195,7 +206,7 @@ public final class CobbleTableSchema implements Serializable {
                             + expected.length
                             + " columns but the write contains "
                             + actual.length
-                            + ". Schema evolution is not supported yet.");
+                            + ".");
         }
         for (int i = 0; i < expected.length; i++) {
             if (!expected[i].name().equals(actual[i].name())) {

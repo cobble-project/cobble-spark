@@ -14,17 +14,20 @@ import java.util.OptionalLong;
 public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     private final CobbleOptions.CobbleTableConfig config;
-    private final CobbleTableSchema schema;
+    private final CobbleTableSchema sourceSchema;
+    private final CobbleTableSchema targetSchema;
     private final StructType requiredSchema;
     private final TableScanPlan scanPlan;
 
     public CobbleScan(
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
+            CobbleTableSchema sourceSchema,
+            CobbleTableSchema targetSchema,
             StructType requiredSchema,
             TableScanPlan scanPlan) {
         this.config = config;
-        this.schema = schema;
+        this.sourceSchema = sourceSchema;
+        this.targetSchema = targetSchema;
         this.requiredSchema = requiredSchema;
         this.scanPlan = scanPlan;
     }
@@ -36,7 +39,7 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     @Override
     public Batch toBatch() {
-        return new CobbleBatch(config, schema, requiredSchema, scanPlan);
+        return new CobbleBatch(config, sourceSchema, targetSchema, requiredSchema, scanPlan);
     }
 
     @Override

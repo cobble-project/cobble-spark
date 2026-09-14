@@ -12,15 +12,18 @@ public final class CobblePartitionReaderFactory implements PartitionReaderFactor
     private static final long serialVersionUID = 1L;
 
     private final CobbleOptions.CobbleTableConfig config;
-    private final CobbleTableSchema schema;
+    private final CobbleTableSchema sourceSchema;
+    private final CobbleTableSchema targetSchema;
     private final StructType requiredSchema;
 
     public CobblePartitionReaderFactory(
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
+            CobbleTableSchema sourceSchema,
+            CobbleTableSchema targetSchema,
             StructType requiredSchema) {
         this.config = config;
-        this.schema = schema;
+        this.sourceSchema = sourceSchema;
+        this.targetSchema = targetSchema;
         this.requiredSchema = requiredSchema;
     }
 
@@ -31,6 +34,7 @@ public final class CobblePartitionReaderFactory implements PartitionReaderFactor
                     "Unsupported input partition type: " + partition.getClass().getName());
         }
         CobbleInputPartition cobblePartition = (CobbleInputPartition) partition;
-        return new CobblePartitionReader(cobblePartition.split(), config, schema, requiredSchema);
+        return new CobblePartitionReader(
+                cobblePartition.split(), config, sourceSchema, targetSchema, requiredSchema);
     }
 }

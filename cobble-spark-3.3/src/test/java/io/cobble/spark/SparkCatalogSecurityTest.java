@@ -4,6 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.cobble.table.LogicalTypes;
+import io.cobble.table.TimestampKind;
+
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -338,6 +341,20 @@ public class SparkCatalogSecurityTest {
                                 schema(),
                                 new Transform[0],
                                 conflictingKeys));
+    }
+
+    @Test
+    public void unsupportedNativeTimestampShapesAreRejectedRatherThanTruncated() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        CobbleSparkTypes.toSparkType(
+                                LogicalTypes.timestamp(7, TimestampKind.WITH_LOCAL_TIME_ZONE)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        CobbleSparkTypes.toSparkType(
+                                LogicalTypes.timestamp(6, TimestampKind.WITHOUT_TIME_ZONE)));
     }
 
     private SparkCatalog initializeCatalog(Map<String, String> options) {

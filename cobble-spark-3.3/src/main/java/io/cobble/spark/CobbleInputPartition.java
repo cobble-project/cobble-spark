@@ -15,17 +15,20 @@ public final class CobbleInputPartition implements InputPartition {
 
     private final TableScanSplit split;
     private final CobbleOptions.CobbleTableConfig config;
-    private final CobbleTableSchema schema;
+    private final CobbleTableSchema sourceSchema;
+    private final CobbleTableSchema targetSchema;
     private final StructType requiredSchema;
 
     public CobbleInputPartition(
             TableScanSplit split,
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
+            CobbleTableSchema sourceSchema,
+            CobbleTableSchema targetSchema,
             StructType requiredSchema) {
         this.split = split;
         this.config = config;
-        this.schema = schema;
+        this.sourceSchema = sourceSchema;
+        this.targetSchema = targetSchema;
         this.requiredSchema = requiredSchema;
     }
 
@@ -37,8 +40,12 @@ public final class CobbleInputPartition implements InputPartition {
         return config;
     }
 
-    public CobbleTableSchema schema() {
-        return schema;
+    public CobbleTableSchema sourceSchema() {
+        return sourceSchema;
+    }
+
+    public CobbleTableSchema targetSchema() {
+        return targetSchema;
     }
 
     public StructType requiredSchema() {

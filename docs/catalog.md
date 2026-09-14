@@ -55,6 +55,26 @@ Spark process can append to that snapshot with a different writer parallelism.
 Conflicting values for one key within a single distributed input have no defined
 ordering; order-dependent updates must be separated into committed batches.
 
+## Schema evolution and historical reads
+
+The catalog supports appending nullable top-level columns, dropping non-key
+columns, renaming columns, native lossless type widening, and relaxing non-key
+`NOT NULL` constraints. Nested edits, column ordering and comments are not
+supported. Each ALTER batch is validated and applied atomically by the native
+catalog.
+
+Latest reads use the catalog schema and map snapshot fields by stable field ID:
+new fields read as `NULL`, renamed fields retain their values, and dropped then
+re-added names do not recover the deleted field's values. Writes use the latest
+catalog schema. Existing snapshots retain their original schemas and data.
+Numeric snapshot versions through Spark's versioned catalog API and the
+`snapshot-id` read option use the snapshot's own schema and are read-only;
+timestamp-based version lookup is not implemented.
+
+Timestamp interoperability currently supports Cobble's local-time-zone timestamp
+with precision up to microseconds. No-time-zone timestamps and higher precision
+are rejected rather than implicitly converted or truncated.
+
 ## Sharing with Flink
 
 Use the same warehouse, `storage-id` and bucket count with Cobble Flink's native
@@ -94,7 +114,8 @@ SELECT id, amount, description FROM incoming_orders;
 - A scan is pinned to its planned snapshot. Appending after planning does not
   change the data returned by that scan.
 - Namespaces are single-level. Rename stays within a namespace and preserves the
-  native table identity.
+  native table identity. Namespace metadata, table comments, custom locations,
+  partition transforms, `PURGE` and namespace `CASCADE` are not supported.
 - `DROP TABLE` unregisters a table; it does not recursively delete its data or
   historical snapshots. Recreating the name creates a different table identity.
   Storage reclamation must be managed separately.

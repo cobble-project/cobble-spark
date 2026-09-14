@@ -265,7 +265,8 @@ public class CobbleSparkReadWriteTest {
                 1);
         assertTrue(loadCurrentSnapshot(config).id > plan.snapshotId());
 
-        CobbleBatch batch = new CobbleBatch(config, scanSchema, scanSchema.toStructType(), plan);
+        CobbleBatch batch =
+                new CobbleBatch(config, scanSchema, scanSchema, scanSchema.toStructType(), plan);
         PartitionReaderFactory factory = batch.createReaderFactory();
         List<Integer> ids = new java.util.ArrayList<Integer>();
         List<String> names = new java.util.ArrayList<String>();

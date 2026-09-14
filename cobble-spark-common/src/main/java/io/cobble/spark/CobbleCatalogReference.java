@@ -83,4 +83,17 @@ public final class CobbleCatalogReference implements Serializable {
                     "catalog table identity changed since this Spark operation was planned");
         }
     }
+
+    /**
+     * Validates a fixed historical read without requiring today's catalog schema version.
+     *
+     * <p>A later ALTER must not invalidate a snapshot that already carries its own schema, while a
+     * drop-and-recreate with the same name remains unsafe because it changes the table id.
+     */
+    public void validateTable(CatalogTable table) {
+        if (table.tableId() != tableId) {
+            throw new IllegalStateException(
+                    "catalog table identity changed since this Spark operation was planned");
+        }
+    }
 }

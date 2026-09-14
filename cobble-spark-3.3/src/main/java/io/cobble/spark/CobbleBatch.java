@@ -15,17 +15,20 @@ import java.util.List;
 public final class CobbleBatch implements Batch {
 
     private final CobbleOptions.CobbleTableConfig config;
-    private final CobbleTableSchema schema;
+    private final CobbleTableSchema sourceSchema;
+    private final CobbleTableSchema targetSchema;
     private final StructType requiredSchema;
     private final TableScanPlan scanPlan;
 
     public CobbleBatch(
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
+            CobbleTableSchema sourceSchema,
+            CobbleTableSchema targetSchema,
             StructType requiredSchema,
             TableScanPlan scanPlan) {
         this.config = config;
-        this.schema = schema;
+        this.sourceSchema = sourceSchema;
+        this.targetSchema = targetSchema;
         this.requiredSchema = requiredSchema;
         this.scanPlan = scanPlan;
     }
@@ -38,13 +41,15 @@ public final class CobbleBatch implements Batch {
         List<TableScanSplit> splits = scanPlan.splits();
         List<InputPartition> partitions = new ArrayList<>(splits.size());
         for (TableScanSplit split : splits) {
-            partitions.add(new CobbleInputPartition(split, config, schema, requiredSchema));
+            partitions.add(
+                    new CobbleInputPartition(
+                            split, config, sourceSchema, targetSchema, requiredSchema));
         }
         return partitions.toArray(new InputPartition[0]);
     }
 
     @Override
     public PartitionReaderFactory createReaderFactory() {
-        return new CobblePartitionReaderFactory(config, schema, requiredSchema);
+        return new CobblePartitionReaderFactory(config, sourceSchema, targetSchema, requiredSchema);
     }
 }

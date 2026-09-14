@@ -60,15 +60,23 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
         CobbleTableSchema schema;
         int totalBuckets;
-        if (currentSnapshot != null || config.isCatalogTable()) {
+        if (config.isCatalogTable()) {
+            // A catalog relation captures the latest catalog schema on the driver. Its current
+            // data snapshot can legitimately embed an older schema, so never derive write
+            // encoding from that snapshot.
             schema =
-                    currentSnapshot != null
-                            ? CobbleTableRuntime.loadSchema(config, currentSnapshot)
-                            : CobbleTableSchema.fromTableSchema(
-                                    config.catalogReference().schema(),
-                                    config.hasBucketCount()
+                    CobbleTableSchema.fromTableSchema(
+                            config.catalogReference().schema(),
+                            currentSnapshot != null
+                                    ? currentSnapshot.totalBuckets
+                                    : (config.hasBucketCount()
                                             ? config.bucketCount()
-                                            : CobbleOptions.DEFAULT_BUCKET);
+                                            : CobbleOptions.DEFAULT_BUCKET));
+            schema.validateWriteSchema(data.schema());
+            validatePrimaryKeyOption(schema);
+            totalBuckets = schema.totalBuckets();
+        } else if (currentSnapshot != null) {
+            schema = CobbleTableRuntime.loadSchema(config, currentSnapshot);
             schema.validateWriteSchema(data.schema());
             validatePrimaryKeyOption(schema);
             totalBuckets = schema.totalBuckets();

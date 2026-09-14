@@ -11,25 +11,28 @@ import org.apache.spark.sql.types.StructType;
 public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownRequiredColumns {
 
     private final CobbleOptions.CobbleTableConfig config;
-    private final CobbleTableSchema schema;
+    private final CobbleTableSchema sourceSchema;
+    private final CobbleTableSchema targetSchema;
     private final TableScanPlan scanPlan;
     private StructType requiredSchema;
 
     public CobbleScanBuilder(
             CobbleOptions.CobbleTableConfig config,
-            CobbleTableSchema schema,
+            CobbleTableSchema sourceSchema,
+            CobbleTableSchema targetSchema,
             TableScanPlan scanPlan) {
         this.config = config;
-        this.schema = schema;
+        this.sourceSchema = sourceSchema;
+        this.targetSchema = targetSchema;
         this.scanPlan = scanPlan;
-        this.requiredSchema = schema.toStructType();
+        this.requiredSchema = targetSchema.toStructType();
     }
 
     @Override
     public void pruneColumns(StructType requiredSchema) {
         for (org.apache.spark.sql.types.StructField field : requiredSchema.fields()) {
             try {
-                schema.ordinalOf(field.name());
+                targetSchema.ordinalOf(field.name());
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException(
                         "Column '"
@@ -45,7 +48,7 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
 
     @Override
     public Scan build() {
-        return new CobbleScan(config, schema, requiredSchema, scanPlan);
+        return new CobbleScan(config, sourceSchema, targetSchema, requiredSchema, scanPlan);
     }
 
     private String name() {
