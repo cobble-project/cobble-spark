@@ -95,6 +95,10 @@ No Spark-specific schema sidecar is required. Consumer modes and refresh behavio
 depend on the connector: this Spark implementation provides fixed batch scans,
 not a Structured Streaming source or sink.
 
+Configure snapshot retention on every writer. Spark's `snapshot.retention=0`
+does not prevent a Flink writer from expiring historical global snapshots under
+its own retention policy.
+
 The current Flink catalog sink requires existing shard boundaries to match its
 configured `sink.parallelism`; changing the Flink environment's default
 parallelism alone does not set this connector option. When taking over a table
