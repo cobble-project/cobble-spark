@@ -5,8 +5,22 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.cobble.table.BucketHash;
+import io.cobble.table.KeyCodec;
+import io.cobble.table.Value;
 
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.Test;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 /** Tests for bucket hashing and writer range math. */
 public class CobbleBucketMathTest {
@@ -73,5 +87,56 @@ public class CobbleBucketMathTest {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> CobbleBucketMath.writerIndexForBucket(16, 16, 4));
+    }
+
+    @Test
+    public void converterBucketCacheSurvivesSerializationWithoutChangingProtocol()
+            throws Exception {
+        StructType schema =
+                DataTypes.createStructType(
+                        Arrays.asList(
+                                DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                                DataTypes.createStructField("text", DataTypes.StringType, false),
+                                DataTypes.createStructField("bytes", DataTypes.BinaryType, false)));
+        CobbleTableSchema tableSchema =
+                CobbleTableSchema.fromStructType(schema, Arrays.asList("id", "text", "bytes"), 17);
+        byte[] largeBytes = new byte[64 * 1024];
+        for (int i = 0; i < largeBytes.length; i++) largeBytes[i] = (byte) (i * 19);
+        List<Row> rows =
+                Arrays.asList(
+                        RowFactory.create(
+                                -7, "\u4f60\u597d\u0000snowman-\u2603", new byte[] {0, 1, -1}),
+                        RowFactory.create(
+                                Integer.MIN_VALUE, "\u00df\u0000emoji-\ud83d\ude80", largeBytes));
+
+        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(tableSchema);
+        for (Row row : rows) assertProtocolBucket(tableSchema, converter, row);
+
+        CobbleSparkRowConverter restored = roundTrip(converter);
+        for (Row row : rows) assertProtocolBucket(tableSchema, restored, row);
+    }
+
+    private static void assertProtocolBucket(
+            CobbleTableSchema schema, CobbleSparkRowConverter converter, Row row) {
+        List<Value> values = converter.toValues(row);
+        int[] ordinals = schema.bucketKeyOrdinals();
+        List<Value> bucketValues = new ArrayList<Value>(ordinals.length);
+        for (int ordinal : ordinals) bucketValues.add(values.get(ordinal));
+        int expected =
+                new BucketHash(schema.totalBuckets())
+                        .bucket(KeyCodec.encode(schema.bucketKeyTypes(), bucketValues));
+        assertEquals(expected, converter.bucket(row));
+    }
+
+    private static CobbleSparkRowConverter roundTrip(CobbleSparkRowConverter converter)
+            throws Exception {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+            output.writeObject(converter);
+        }
+        try (ObjectInputStream input =
+                new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            return (CobbleSparkRowConverter) input.readObject();
+        }
     }
 }

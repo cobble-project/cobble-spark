@@ -19,6 +19,8 @@ import org.apache.spark.sql.Row;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.BufferOverflowException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -37,6 +39,10 @@ import java.util.Map;
  * which also supports a changed writer count between jobs.
  */
 public final class CobbleShardWriteTask {
+
+    private static final int INITIAL_KEY_BUFFER_BYTES = 4 * 1024;
+    private static final int INITIAL_ROW_BUFFER_BYTES = 64 * 1024;
+    private static final int MAX_BUFFER_CAPACITY = Integer.MAX_VALUE - 8;
 
     private CobbleShardWriteTask() {}
 
@@ -61,10 +67,7 @@ public final class CobbleShardWriteTask {
         try {
             try (Table table =
                     Table.create(db, CobbleTableRuntime.TABLE_NAME, schema.toTableSchema())) {
-                while (rows.hasNext()) {
-                    List<Value> values = converter.toValues(rows.next());
-                    table.put(values);
-                }
+                putRows(table, rows, converter);
             }
             PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
             ShardSnapshot shardSnapshot;
@@ -106,14 +109,71 @@ public final class CobbleShardWriteTask {
                 context.overwrite() || context.baseSnapshot() == null
                         ? builder.open()
                         : builder.openNewFromGlobalSnapshot(context.baseSnapshot())) {
-            while (rows.hasNext()) {
-                table.put(converter.toValues(rows.next()));
-            }
+            putRows(table, rows, converter);
             ShardSnapshot snapshot = table.snapshot();
             return Collections.singleton(
                             new CobbleShardResult(
                                     context.totalBuckets(), rangeStart, null, snapshot))
                     .iterator();
+        }
+    }
+
+    /** Encodes each row into task-owned direct buffers before one native put call. */
+    private static void putRows(
+            Table table, Iterator<Row> rows, CobbleSparkRowConverter converter) {
+        if (!rows.hasNext()) {
+            return;
+        }
+        DirectWriteBuffers buffers = new DirectWriteBuffers();
+        while (rows.hasNext()) {
+            List<Value> values = converter.toValues(rows.next());
+            for (; ; ) {
+                try {
+                    table.putDirect(values, buffers.keyBuffer, buffers.rowBuffer);
+                    break;
+                } catch (BufferOverflowException overflow) {
+                    // Table.putDirect clears both buffers, encodes the ordered primary key first,
+                    // then encodes values. KeyCodec restores keyBuffer to position zero on an
+                    // encoding failure, while value encoding leaves the completed key intact.
+                    // Consequently this retry happens before JNI and grows only the buffer that
+                    // could not fit; a native failure is never retried.
+                    if (buffers.keyBuffer.position() == 0) {
+                        buffers.growKey(overflow);
+                    } else {
+                        buffers.growRow(overflow);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Small per-task direct-buffer owner. Buffers grow only when a legal row needs more space. */
+    private static final class DirectWriteBuffers {
+        private ByteBuffer keyBuffer = ByteBuffer.allocateDirect(INITIAL_KEY_BUFFER_BYTES);
+        private ByteBuffer rowBuffer = ByteBuffer.allocateDirect(INITIAL_ROW_BUFFER_BYTES);
+
+        private void growKey(BufferOverflowException overflow) {
+            keyBuffer = grow(keyBuffer, "primary key", overflow);
+        }
+
+        private void growRow(BufferOverflowException overflow) {
+            rowBuffer = grow(rowBuffer, "row values", overflow);
+        }
+
+        private static ByteBuffer grow(
+                ByteBuffer current, String contents, BufferOverflowException overflow) {
+            int capacity = current.capacity();
+            if (capacity >= MAX_BUFFER_CAPACITY) {
+                throw new IllegalArgumentException(
+                        "Cobble " + contents + " cannot fit in a Java direct ByteBuffer.",
+                        overflow);
+            }
+            int next =
+                    (int)
+                            Math.min(
+                                    MAX_BUFFER_CAPACITY,
+                                    Math.max((long) capacity + 1L, (long) capacity * 2L));
+            return ByteBuffer.allocateDirect(next);
         }
     }
 

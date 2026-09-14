@@ -114,7 +114,11 @@ public final class CobblePaths {
      */
     public static Config createScanConfig(
             CobbleOptions.CobbleTableConfig config, int totalBuckets, int scanColumnCount) {
-        Config scanConfig = new Config().numColumns(scanColumnCount).totalBuckets(totalBuckets);
+        // Native scan configuration always needs one physical column, even though a key-only
+        // table has zero semantic value columns. TableScanSplit retains that hidden existence
+        // column and connector readers deliberately ignore it for key-only/COUNT projections.
+        Config scanConfig =
+                new Config().numColumns(Math.max(1, scanColumnCount)).totalBuckets(totalBuckets);
         scanConfig.memtableCapacity = 1;
         scanConfig.memtableBufferCount = 1;
         scanConfig.blockCacheSize =

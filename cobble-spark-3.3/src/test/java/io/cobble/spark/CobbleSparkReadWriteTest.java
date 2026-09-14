@@ -1,5 +1,6 @@
 package io.cobble.spark;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -244,6 +245,102 @@ public class CobbleSparkReadWriteTest {
         // Spark pushes an empty required schema for count(*). The reader still needs a hidden
         // existence column, but must not decode or expose a user column.
         assertEquals(2L, read.selectExpr("count(*)").collectAsList().get(0).getLong(0));
+    }
+
+    @Test
+    public void keyOnlyTableSupportsWriteReadAndCount() {
+        StructType keyOnlySchema =
+                DataTypes.createStructType(
+                        Collections.singletonList(
+                                DataTypes.createStructField("id", DataTypes.IntegerType, false)));
+        spark.createDataFrame(
+                        Arrays.asList(
+                                RowFactory.create(3), RowFactory.create(1), RowFactory.create(2)),
+                        keyOnlySchema)
+                .write()
+                .format("cobble")
+                .option("path", tableDir.toUri().toString())
+                .option("primary-key", "id")
+                .option("bucket", "2")
+                .option("write.tasks", "1")
+                .save();
+
+        Dataset<Row> read = spark.read().format("cobble").load(tableDir.toUri().toString());
+        assertEquals(
+                Arrays.asList(1, 2, 3),
+                read.orderBy("id").collectAsList().stream()
+                        .map(row -> row.getInt(0))
+                        .collect(java.util.stream.Collectors.toList()));
+        assertEquals(3L, read.selectExpr("count(*)").first().getLong(0));
+    }
+
+    @Test
+    public void directScanCopiesLargeBinaryAndNestedBinaryBeforeCursorAdvances() {
+        int largeBytes = 3 * 1024 * 1024;
+        String firstKey = "key-a-" + repeated('a', largeBytes);
+        String secondKey = "key-b-" + repeated('b', largeBytes);
+        byte[] firstPayload = new byte[largeBytes];
+        byte[] firstNestedPayload = new byte[largeBytes];
+        byte[] secondPayload = new byte[largeBytes];
+        byte[] secondNestedPayload = new byte[largeBytes];
+        for (int i = 0; i < largeBytes; i++) {
+            firstPayload[i] = (byte) (i * 31);
+            firstNestedPayload[i] = (byte) (i * 17);
+            secondPayload[i] = (byte) (i * 7);
+            secondNestedPayload[i] = (byte) (i * 13);
+        }
+        StructType nestedType =
+                DataTypes.createStructType(
+                        Collections.singletonList(
+                                DataTypes.createStructField("blob", DataTypes.BinaryType, true)));
+        StructType largeSchema =
+                DataTypes.createStructType(
+                        Arrays.asList(
+                                DataTypes.createStructField("id", DataTypes.StringType, false),
+                                DataTypes.createStructField("payload", DataTypes.BinaryType, false),
+                                DataTypes.createStructField("nested", nestedType, false)));
+        spark.createDataFrame(
+                        Arrays.asList(
+                                RowFactory.create(
+                                        firstKey,
+                                        firstPayload,
+                                        RowFactory.create(firstNestedPayload)),
+                                RowFactory.create(
+                                        secondKey,
+                                        secondPayload,
+                                        RowFactory.create(secondNestedPayload))),
+                        largeSchema)
+                .write()
+                .format("cobble")
+                .option("path", tableDir.toUri().toString())
+                .option("primary-key", "id")
+                .option("bucket", "2")
+                .option("write.tasks", "1")
+                .save();
+
+        // One scan cursor advances across both rows before collectAsList returns, then closes.
+        // These assertions prove root and nested binary leaves were copied out of its reusable
+        // native I/O buffer rather than retaining dangling direct-buffer views.
+        List<Row> read =
+                spark.read().format("cobble").load(tableDir.toUri().toString()).collectAsList();
+        assertEquals(2, read.size());
+        for (Row row : read) {
+            if (firstKey.equals(row.getString(0))) {
+                assertArrayEquals(firstPayload, row.<byte[]>getAs(1));
+                assertArrayEquals(firstNestedPayload, row.getStruct(2).<byte[]>getAs(0));
+            } else if (secondKey.equals(row.getString(0))) {
+                assertArrayEquals(secondPayload, row.<byte[]>getAs(1));
+                assertArrayEquals(secondNestedPayload, row.getStruct(2).<byte[]>getAs(0));
+            } else {
+                throw new AssertionError("unexpected large binary row key");
+            }
+        }
+    }
+
+    private static String repeated(char value, int count) {
+        char[] chars = new char[count];
+        Arrays.fill(chars, value);
+        return new String(chars);
     }
 
     @Test

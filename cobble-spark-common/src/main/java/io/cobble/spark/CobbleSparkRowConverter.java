@@ -15,6 +15,8 @@ import org.apache.spark.unsafe.types.UTF8String;
 
 import java.io.Serializable;
 import java.math.BigDecimal;
+import java.nio.Buffer;
+import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.sql.Date;
 import java.sql.Timestamp;
@@ -26,15 +28,21 @@ import java.util.Map;
 /** Converts Spark rows to the same native values and codecs used by the Flink connector. */
 public final class CobbleSparkRowConverter implements Serializable {
     private static final long serialVersionUID = 1L;
+    private static final int INITIAL_BUCKET_KEY_BYTES = 256;
+    private static final int MAX_BUFFER_CAPACITY = Integer.MAX_VALUE - 8;
 
     private final CobbleTableSchema schema;
     private final int[] bucketOrdinals;
+    private final List<LogicalType> bucketTypes;
     private transient BucketHash bucketHash;
+    // One converter belongs to one writer task, so these avoid per-row bucket-key allocations.
+    private transient ArrayList<Value> bucketValues;
+    private transient ByteBuffer bucketBuffer;
 
     public CobbleSparkRowConverter(CobbleTableSchema schema) {
         this.schema = schema;
         this.bucketOrdinals = schema.bucketKeyOrdinals();
-        this.bucketHash = new BucketHash(schema.totalBuckets());
+        this.bucketTypes = schema.bucketKeyTypes();
     }
 
     public List<Value> toValues(Row row) {
@@ -51,20 +59,58 @@ public final class CobbleSparkRowConverter implements Serializable {
 
     /** Computes the bucket while converting only bucket-key fields, not the complete row. */
     public int bucket(Row row) {
-        List<Value> bucketValues = new ArrayList<Value>(bucketOrdinals.length);
+        ArrayList<Value> values = bucketValues();
+        values.clear();
         for (int ordinal : bucketOrdinals) {
-            bucketValues.add(
+            values.add(
                     toValue(
                             schema.logicalType(ordinal),
                             row.isNullAt(ordinal) ? null : row.get(ordinal)));
         }
-        byte[] encoded = KeyCodec.encode(schema.bucketKeyTypes(), bucketValues);
         BucketHash hash = bucketHash;
         if (hash == null) {
             hash = new BucketHash(schema.totalBuckets());
             bucketHash = hash;
         }
-        return hash.bucket(encoded);
+        for (; ; ) {
+            ByteBuffer encoded = bucketBuffer();
+            ((Buffer) encoded).clear();
+            try {
+                KeyCodec.encodeTo(bucketTypes, values, encoded);
+                ((Buffer) encoded).flip();
+                return hash.bucket(encoded);
+            } catch (BufferOverflowException overflow) {
+                growBucketBuffer(overflow);
+            }
+        }
+    }
+
+    private ArrayList<Value> bucketValues() {
+        if (bucketValues == null) {
+            bucketValues = new ArrayList<Value>(bucketOrdinals.length);
+        }
+        return bucketValues;
+    }
+
+    private ByteBuffer bucketBuffer() {
+        if (bucketBuffer == null) {
+            bucketBuffer = ByteBuffer.allocate(INITIAL_BUCKET_KEY_BYTES);
+        }
+        return bucketBuffer;
+    }
+
+    private void growBucketBuffer(BufferOverflowException overflow) {
+        int current = bucketBuffer().capacity();
+        if (current >= MAX_BUFFER_CAPACITY) {
+            throw new IllegalArgumentException(
+                    "Cobble bucket key cannot fit in a Java ByteBuffer.", overflow);
+        }
+        int next =
+                (int)
+                        Math.min(
+                                MAX_BUFFER_CAPACITY,
+                                Math.max((long) current + 1L, (long) current * 2L));
+        bucketBuffer = ByteBuffer.allocate(next);
     }
 
     public static Object toSparkInternal(LogicalType type, Value value) {

@@ -37,7 +37,7 @@ public final class CobbleTableSchema implements Serializable {
         this.totalBuckets = totalBuckets;
     }
 
-    /** Builds the exact native schema used by Cobble Flink for the same logical row type. */
+    /** Builds a native table schema from Spark SQL fields and primary keys. */
     public static CobbleTableSchema fromStructType(
             StructType schema, List<String> primaryKeys, int totalBuckets) {
         if (schema == null || schema.fields().length == 0) {

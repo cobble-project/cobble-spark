@@ -1,6 +1,7 @@
 package io.cobble.spark;
 
-import io.cobble.ScanCursor;
+import io.cobble.DirectScanCursor;
+import io.cobble.DirectScanEntry;
 import io.cobble.table.KeyCodec;
 import io.cobble.table.TableScanSplit;
 import io.cobble.table.Value;
@@ -21,8 +22,8 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Reads one scan split: opens the scan cursor on the executor, decodes the length framed key and
- * the projected value columns into a reused internal row.
+ * Reads one scan split: opens the direct scan cursor on the executor, decodes Cobble's ordered
+ * composite key and projected value columns into a reused internal row.
  */
 public final class CobblePartitionReader implements PartitionReader<InternalRow> {
 
@@ -47,7 +48,7 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
 
     private GenericInternalRow row;
     private GenericInternalRow castInput;
-    private ScanCursor cursor;
+    private DirectScanCursor cursor;
 
     public CobblePartitionReader(
             TableScanSplit split,
@@ -142,20 +143,18 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         if (cursor == null) {
             openCursor();
         }
-        ScanCursor.Entry entry = cursor.nextEntry();
+        DirectScanEntry entry = cursor.nextEntry();
         if (entry == null) {
             return false;
         }
         if (row == null) {
             row = new GenericInternalRow(requiredSchema.fields().length);
         }
-        if (castInput == null) {
-            castInput = new GenericInternalRow(1);
-        }
         List<Value> keyValues =
                 needsKey
-                        ? KeyCodec.decode(primaryKeyTypes, ByteBuffer.wrap(entry.key))
+                        ? KeyCodec.decode(primaryKeyTypes, entry.getKey())
                         : Collections.emptyList();
+        io.cobble.DirectColumns columns = null;
         for (int i = 0; i < fieldKeySlot.length; i++) {
             Object value;
             if (fieldMissingFromSource[i]) {
@@ -172,17 +171,26 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
                                     + i
                                     + " was not requested in the scan.");
                 }
-                byte[] encoded = entry.columns[position];
+                if (columns == null) {
+                    columns = entry.columnsView();
+                }
+                ByteBuffer encoded = columns.get(position);
                 if (encoded == null) {
                     // An added nullable field can be absent from an older physical SST after a
                     // later snapshot is materialized. Native represents that as no column bytes.
                     value = null;
                 } else {
-                    Value decoded = ValueCodec.decodeOwned(fieldTypes[i], ByteBuffer.wrap(encoded));
+                    // Direct columns borrow the cursor's reusable native buffer. Convert to a
+                    // Spark-owned value before advancing the cursor; binary leaves are copied by
+                    // toSparkInternal exactly once.
+                    Value decoded = ValueCodec.decode(fieldTypes[i], encoded);
                     value = CobbleSparkRowConverter.toSparkInternal(fieldTypes[i], decoded);
                 }
             }
             if (value != null && casts[i] != null) {
+                if (castInput == null) {
+                    castInput = new GenericInternalRow(1);
+                }
                 castInput.update(0, value);
                 value = casts[i].eval(castInput);
             }
@@ -199,7 +207,7 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         }
         try {
             cursor =
-                    split.openScanner(
+                    split.openDirectScanner(
                             CobblePaths.createScanConfig(
                                     config, totalBuckets, sourceSchema.valueColumnCount()),
                             projectedFields,
