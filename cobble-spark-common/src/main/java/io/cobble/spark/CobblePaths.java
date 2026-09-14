@@ -118,7 +118,7 @@ public final class CobblePaths {
         scanConfig.memtableCapacity = 1;
         scanConfig.memtableBufferCount = 1;
         scanConfig.blockCacheSize =
-                positiveInt(config.readBlockCacheBytes(), CobbleOptions.READ_BLOCK_CACHE_MEMORY);
+                nonNegativeInt(config.readBlockCacheBytes(), CobbleOptions.READ_BLOCK_CACHE_MEMORY);
         scanConfig.blockCacheHybridEnabled = false;
         scanConfig.blockCacheHybridDiskSize = 0;
         scanConfig.governanceMode = Config.GovernanceMode.NOOP;
@@ -160,6 +160,14 @@ public final class CobblePaths {
         if (value <= 0L || value > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
                     optionKey + " must be in (0, " + Integer.MAX_VALUE + "].");
+        }
+        return (int) value;
+    }
+
+    private static int nonNegativeInt(long value, String optionKey) {
+        if (value < 0L || value > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    optionKey + " must be in [0, " + Integer.MAX_VALUE + "].");
         }
         return (int) value;
     }

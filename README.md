@@ -11,7 +11,9 @@ the DataFrame API.
 
 ## Status
 
-Cobble Spark is under active development. The initial project structure targets Spark 3.3 with Scala 2.12.
+Cobble Spark is under active development, targeting Spark 3.3 with Scala 2.12.
+It supports batch reads and primary-key writes through Cobble's native table
+and file catalog APIs. See [catalog usage and limitations](docs/catalog.md).
 
 ## License
 

@@ -2,12 +2,16 @@ package io.cobble.spark.write;
 
 import io.cobble.GlobalSnapshot;
 import io.cobble.spark.CobbleBucketMath;
+import io.cobble.spark.CobbleCatalogReference;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleSparkRowConverter;
 import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.spark.CobbleTableSchema;
+import io.cobble.table.CatalogTable;
+import io.cobble.table.FileCatalog;
+import io.cobble.table.TableWritePlan;
 
 import org.apache.spark.Partitioner;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -56,8 +60,15 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
         CobbleTableSchema schema;
         int totalBuckets;
-        if (currentSnapshot != null) {
-            schema = CobbleTableRuntime.loadSchema(config, currentSnapshot);
+        if (currentSnapshot != null || config.isCatalogTable()) {
+            schema =
+                    currentSnapshot != null
+                            ? CobbleTableRuntime.loadSchema(config, currentSnapshot)
+                            : CobbleTableSchema.fromTableSchema(
+                                    config.catalogReference().schema(),
+                                    config.hasBucketCount()
+                                            ? config.bucketCount()
+                                            : CobbleOptions.DEFAULT_BUCKET);
             schema.validateWriteSchema(data.schema());
             validatePrimaryKeyOption(schema);
             totalBuckets = schema.totalBuckets();
@@ -91,9 +102,20 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         GlobalSnapshot baseSnapshot = null;
         if (!overwriteAll) baseSnapshot = currentSnapshot;
 
+        TableWritePlan catalogWritePlan = null;
+        if (config.isCatalogTable()) {
+            catalogWritePlan = catalogWritePlan(config, totalBuckets);
+        }
+
         final CobbleWriteContext context =
                 new CobbleWriteContext(
-                        config, schema, totalBuckets, writerCount, overwriteAll, baseSnapshot);
+                        config,
+                        schema,
+                        totalBuckets,
+                        writerCount,
+                        overwriteAll,
+                        baseSnapshot,
+                        catalogWritePlan);
         final CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
         final int buckets = totalBuckets;
         final int writers = writerCount;
@@ -131,6 +153,9 @@ public final class CobbleInsertableRelation implements InsertableRelation {
 
     private static GlobalSnapshot loadCurrentGlobalSnapshot(
             CobbleOptions.CobbleTableConfig config) {
+        if (config.isCatalogTable()) {
+            return CobbleTableRuntime.loadSnapshot(config);
+        }
         io.cobble.DbCoordinator coordinator = null;
         try {
             coordinator =
@@ -145,6 +170,23 @@ public final class CobbleInsertableRelation implements InsertableRelation {
             if (coordinator != null) {
                 coordinator.close();
             }
+        }
+    }
+
+    private static TableWritePlan catalogWritePlan(
+            CobbleOptions.CobbleTableConfig config, int totalBuckets) {
+        CobbleCatalogReference reference = config.catalogReference();
+        try (FileCatalog catalog =
+                        FileCatalog.open(
+                                new io.cobble.Config().addVolume(reference.warehouse()),
+                                reference.storageId());
+                CatalogTable table = catalog.loadTable(reference.identifier())) {
+            if (table.tableId() != reference.tableId()
+                    || table.catalogSchemaId() != reference.catalogSchemaId()) {
+                throw new IllegalStateException(
+                        "catalog table identity changed before write execution");
+            }
+            return table.newWriteBuilder().totalBuckets(totalBuckets).build();
         }
     }
 

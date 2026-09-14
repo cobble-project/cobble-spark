@@ -4,6 +4,7 @@ import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TreeMap;
 
 /** Option keys and the parsed, serializable table configuration for the Cobble Spark connector. */
@@ -68,6 +69,7 @@ public final class CobbleOptions {
         private final int writeTasks;
         private final long writeBufferMemoryBytes;
         private final long readBlockCacheBytes;
+        private final CobbleCatalogReference catalogReference;
 
         private CobbleTableConfig(
                 String pathUri,
@@ -76,7 +78,8 @@ public final class CobbleOptions {
                 int snapshotRetention,
                 int writeTasks,
                 long writeBufferMemoryBytes,
-                long readBlockCacheBytes) {
+                long readBlockCacheBytes,
+                CobbleCatalogReference catalogReference) {
             this.pathUri = pathUri;
             this.bucketCount = bucketCount;
             this.snapshotId = snapshotId;
@@ -84,6 +87,7 @@ public final class CobbleOptions {
             this.writeTasks = writeTasks;
             this.writeBufferMemoryBytes = writeBufferMemoryBytes;
             this.readBlockCacheBytes = readBlockCacheBytes;
+            this.catalogReference = catalogReference;
         }
 
         public String pathUri() {
@@ -126,6 +130,30 @@ public final class CobbleOptions {
 
         public long readBlockCacheBytes() {
             return readBlockCacheBytes;
+        }
+
+        public boolean isCatalogTable() {
+            return catalogReference != null;
+        }
+
+        public CobbleCatalogReference catalogReference() {
+            if (catalogReference == null) {
+                throw new IllegalStateException("table is not catalog-bound");
+            }
+            return catalogReference;
+        }
+
+        /** Attaches a driver-produced catalog identity; raw options cannot construct one. */
+        public CobbleTableConfig withCatalogReference(CobbleCatalogReference reference) {
+            return new CobbleTableConfig(
+                    pathUri,
+                    bucketCount,
+                    snapshotId,
+                    snapshotRetention,
+                    writeTasks,
+                    writeBufferMemoryBytes,
+                    readBlockCacheBytes,
+                    Objects.requireNonNull(reference, "reference"));
         }
 
         @Override
@@ -231,7 +259,14 @@ public final class CobbleOptions {
                         READ_BLOCK_CACHE_MEMORY);
 
         return new CobbleTableConfig(
-                pathUri, bucketCount, snapshotId, retention, writeTasks, writeBuffer, readCache);
+                pathUri,
+                bucketCount,
+                snapshotId,
+                retention,
+                writeTasks,
+                writeBuffer,
+                readCache,
+                null);
     }
 
     /**

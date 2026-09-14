@@ -53,6 +53,10 @@ public final class CobbleShardWriteTask {
 
         CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
 
+        if (context.isCatalogTable()) {
+            return writeCatalogShard(rows, context, rangeStart, rangeEnd, converter);
+        }
+
         Db db = openWriter(context, writerIndex, rangeStart, rangeEnd);
         try {
             try (Table table =
@@ -79,6 +83,37 @@ public final class CobbleShardWriteTask {
                     .iterator();
         } finally {
             db.close();
+        }
+    }
+
+    private static Iterator<CobbleShardResult> writeCatalogShard(
+            Iterator<Row> rows,
+            CobbleWriteContext context,
+            int rangeStart,
+            int rangeEnd,
+            CobbleSparkRowConverter converter)
+            throws IOException {
+        io.cobble.table.TableWriterBuilder builder =
+                context.catalogWritePlan()
+                        .writerBuilder(
+                                CobblePaths.createWriterConfig(
+                                        context.config(),
+                                        context.totalBuckets(),
+                                        rangeStart,
+                                        context.writerCount()))
+                        .bucketRanges(new int[] {rangeStart}, new int[] {rangeEnd});
+        try (Table table =
+                context.overwrite() || context.baseSnapshot() == null
+                        ? builder.open()
+                        : builder.openNewFromGlobalSnapshot(context.baseSnapshot())) {
+            while (rows.hasNext()) {
+                table.put(converter.toValues(rows.next()));
+            }
+            ShardSnapshot snapshot = table.snapshot();
+            return Collections.singleton(
+                            new CobbleShardResult(
+                                    context.totalBuckets(), rangeStart, null, snapshot))
+                    .iterator();
         }
     }
 

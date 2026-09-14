@@ -4,8 +4,11 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
 import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.expressions.Transform;
+import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -27,6 +30,7 @@ public class SparkCatalogSecurityTest {
         SparkCatalog catalog = new SparkCatalog();
         Map<String, String> options = new HashMap<>();
         options.put("path", warehouse.toUri().toString());
+        options.put("bucket", "2");
         catalog.initialize("cobble", new CaseInsensitiveStringMap(options));
         return catalog;
     }
@@ -114,7 +118,7 @@ public class SparkCatalogSecurityTest {
     }
 
     @Test
-    public void externalPathOptionIsOverridden() throws Exception {
+    public void externalPathOptionIsRejected() throws Exception {
         SparkCatalog catalog = newCatalog();
         Path external = Files.createTempDirectory("cobble-outside");
         Map<String, String> properties = new HashMap<>();
@@ -122,15 +126,23 @@ public class SparkCatalogSecurityTest {
         properties.put(CobbleOptions.BUCKET, "2");
         properties.put(CobbleOptions.PATH, external.toUri().toString());
 
-        catalog.createTable(
-                Identifier.of(new String[] {"db"}, "t"), schema(), new Transform[0], properties);
+        catalog.createNamespace(new String[] {"db"}, Collections.emptyMap());
+
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        catalog.createTable(
+                                Identifier.of(new String[] {"db"}, "t"),
+                                schema(),
+                                new Transform[0],
+                                properties));
 
         // No metadata or data is written to the user-supplied path.
         assertFalse(Files.exists(external.resolve("schema")));
         assertFalse(Files.exists(external.resolve("cobble-table.properties")));
-        // Everything lives under the warehouse-managed table directory.
-        assertTrue(Files.isRegularFile(warehouse.resolve("db/t/cobble-table.properties")));
-        assertTrue(catalog.tableExists(Identifier.of(new String[] {"db"}, "t")));
+        // Native FileCatalog owns the registration; no Spark sidecar properties are created.
+        assertFalse(Files.exists(warehouse.resolve("db/t/cobble-table.properties")));
+        assertFalse(catalog.tableExists(Identifier.of(new String[] {"db"}, "t")));
     }
 
     @Test
@@ -177,7 +189,7 @@ public class SparkCatalogSecurityTest {
         properties.put(CobbleOptions.PRIMARY_KEY, "id");
         properties.put(CobbleOptions.SNAPSHOT_RETENTION, "-1");
         assertThrows(
-                IllegalArgumentException.class,
+                UnsupportedOperationException.class,
                 () ->
                         catalog.createTable(
                                 Identifier.of(new String[] {"db"}, "t"),
@@ -187,5 +199,150 @@ public class SparkCatalogSecurityTest {
         assertFalse(catalog.tableExists(Identifier.of(new String[] {"db"}, "t")));
         assertFalse(Files.exists(warehouse.resolve("db/t")));
         assertFalse(catalog.namespaceExists(new String[] {"db"}));
+    }
+
+    @Test
+    public void namespaceMetadataAndPurgeAreExplicitlyUnsupported() throws Exception {
+        SparkCatalog catalog = newCatalog();
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        catalog.createNamespace(
+                                new String[] {"db"},
+                                Collections.singletonMap(
+                                        TableCatalog.PROP_COMMENT, "not persisted")));
+
+        catalog.createNamespace(
+                new String[] {"db"}, Collections.singletonMap(TableCatalog.PROP_OWNER, "spark"));
+        assertTrue(catalog.loadNamespaceMetadata(new String[] {"db"}).isEmpty());
+
+        Map<String, String> commentProperties = properties();
+        commentProperties.put(TableCatalog.PROP_COMMENT, "not persisted");
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        catalog.createTable(
+                                Identifier.of(new String[] {"db"}, "commented"),
+                                schema(),
+                                new Transform[0],
+                                commentProperties));
+
+        Identifier table = Identifier.of(new String[] {"db"}, "t");
+        catalog.createTable(table, schema(), new Transform[0], properties());
+        assertThrows(UnsupportedOperationException.class, () -> catalog.purgeTable(table));
+    }
+
+    @Test
+    public void duplicateCreateMapsToSparkException() throws Exception {
+        SparkCatalog catalog = newCatalog();
+        catalog.createNamespace(new String[] {"db"}, Collections.emptyMap());
+        Identifier table = Identifier.of(new String[] {"db"}, "t");
+        catalog.createTable(table, schema(), new Transform[0], properties());
+
+        assertThrows(
+                TableAlreadyExistsException.class,
+                () -> catalog.createTable(table, schema(), new Transform[0], properties()));
+    }
+
+    @Test
+    public void catalogRuntimeAndOperationOptionsAreValidated() throws Exception {
+        Map<String, String> unknown = new HashMap<>();
+        unknown.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        unknown.put("write-task", "2");
+        assertThrows(UnsupportedOperationException.class, () -> initializeCatalog(unknown));
+
+        Map<String, String> retained = new HashMap<>();
+        retained.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        retained.put(CobbleOptions.SNAPSHOT_RETENTION, "1");
+        assertThrows(UnsupportedOperationException.class, () -> initializeCatalog(retained));
+
+        Map<String, String> oversizedBuffer = new HashMap<>();
+        oversizedBuffer.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        oversizedBuffer.put(CobbleOptions.WRITE_BUFFER_MEMORY, "3g");
+        assertThrows(IllegalArgumentException.class, () -> initializeCatalog(oversizedBuffer));
+
+        SparkCatalog catalog = newCatalog();
+        catalog.createNamespace(new String[] {"db"}, Collections.emptyMap());
+        CobbleTable table =
+                (CobbleTable)
+                        catalog.createTable(
+                                Identifier.of(new String[] {"db"}, "t"),
+                                schema(),
+                                new Transform[0],
+                                properties());
+
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        table.newScanBuilder(
+                                new CaseInsensitiveStringMap(
+                                        Collections.singletonMap(
+                                                CobbleOptions.SNAPSHOT_RETENTION, "1"))));
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        table.newWriteBuilder(
+                                        new LogicalWriteInfo() {
+                                            @Override
+                                            public CaseInsensitiveStringMap options() {
+                                                return new CaseInsensitiveStringMap(
+                                                        Collections.singletonMap(
+                                                                CobbleOptions.SNAPSHOT_ID, "0"));
+                                            }
+
+                                            @Override
+                                            public String queryId() {
+                                                return "snapshot-write";
+                                            }
+
+                                            @Override
+                                            public StructType schema() {
+                                                return schema();
+                                            }
+                                        })
+                                .build());
+
+        Map<String, String> foreignProvider = properties();
+        foreignProvider.put(TableCatalog.PROP_PROVIDER, "parquet");
+        assertThrows(
+                UnsupportedOperationException.class,
+                () ->
+                        catalog.createTable(
+                                Identifier.of(new String[] {"db"}, "foreign"),
+                                schema(),
+                                new Transform[0],
+                                foreignProvider));
+    }
+
+    @Test
+    public void createOptionsNormalizeCaseAndRejectConflicts() throws Exception {
+        SparkCatalog catalog = newCatalog();
+        catalog.createNamespace(new String[] {"db"}, Collections.emptyMap());
+        Map<String, String> upperCaseKey = new HashMap<>();
+        upperCaseKey.put("option.PRIMARY-KEY", "id");
+        catalog.createTable(
+                Identifier.of(new String[] {"db"}, "case_key"),
+                schema(),
+                new Transform[0],
+                upperCaseKey);
+        assertTrue(catalog.tableExists(Identifier.of(new String[] {"db"}, "case_key")));
+
+        Map<String, String> conflictingKeys = new HashMap<>();
+        conflictingKeys.put("PRIMARY-KEY", "id");
+        conflictingKeys.put("option.primary-key", "other");
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        catalog.createTable(
+                                Identifier.of(new String[] {"db"}, "conflicting"),
+                                schema(),
+                                new Transform[0],
+                                conflictingKeys));
+    }
+
+    private SparkCatalog initializeCatalog(Map<String, String> options) {
+        SparkCatalog catalog = new SparkCatalog();
+        catalog.initialize("cobble", new CaseInsensitiveStringMap(options));
+        return catalog;
     }
 }

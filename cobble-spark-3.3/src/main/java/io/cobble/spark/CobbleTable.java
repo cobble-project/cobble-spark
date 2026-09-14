@@ -42,7 +42,9 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
 
     @Override
     public String name() {
-        return config.pathUri();
+        return config.isCatalogTable()
+                ? config.catalogReference().qualifiedName()
+                : config.pathUri();
     }
 
     @Override
@@ -78,6 +80,13 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
         if (snapshot != null) {
             scanPlan = CobbleTableRuntime.loadScanPlan(scanConfig, snapshot);
             schema = CobbleTableSchema.fromTableSchema(scanPlan.schema(), scanPlan.totalBuckets());
+        } else if (scanConfig.isCatalogTable()) {
+            schema =
+                    CobbleTableSchema.fromTableSchema(
+                            scanConfig.catalogReference().schema(),
+                            scanConfig.hasBucketCount()
+                                    ? scanConfig.bucketCount()
+                                    : CobbleOptions.DEFAULT_BUCKET);
         } else if (providedSchema != null && !scanConfig.hasSnapshotId()) {
             List<String> primaryKeys =
                     CobbleTableSchema.parsePrimaryKeyOption(
@@ -99,6 +108,15 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
     public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
         CobbleOptions.CobbleTableConfig writeConfig =
                 operationConfig(info.options().asCaseSensitiveMap());
+        if (writeConfig.isCatalogTable() && writeConfig.hasSnapshotId()) {
+            throw new UnsupportedOperationException(
+                    "Writing a catalog table with snapshot-id is not supported.");
+        }
+        if (writeConfig.isCatalogTable()) {
+            // Fail before Spark launches tasks if a captured table was renamed, dropped, or
+            // recreated after this relation was planned.
+            CobbleTableRuntime.loadSnapshot(writeConfig);
+        }
         Map<String, String> merged = operationOptions(info.options().asCaseSensitiveMap());
         return new CobbleWriteBuilder(
                 writeConfig, providedSchema != null ? providedSchema : info.schema(), merged);
@@ -106,7 +124,16 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
 
     /** Resolves the config for one operation by merging table-level properties with op options. */
     private CobbleOptions.CobbleTableConfig operationConfig(Map<String, String> operationOptions) {
-        return CobbleOptions.parse(operationOptions(operationOptions));
+        CobbleOptions.CobbleTableConfig operation =
+                CobbleOptions.parse(operationOptions(operationOptions));
+        if (!config.isCatalogTable()) {
+            return operation;
+        }
+        if (operation.snapshotRetention() > 0) {
+            throw new UnsupportedOperationException(
+                    "snapshot.retention is not supported for catalog tables.");
+        }
+        return operation.withCatalogReference(config.catalogReference());
     }
 
     private Map<String, String> operationOptions(Map<String, String> operationOptions) {

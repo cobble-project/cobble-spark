@@ -3,6 +3,7 @@ package io.cobble.spark.write;
 import io.cobble.GlobalSnapshot;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobbleTableSchema;
+import io.cobble.table.TableWritePlan;
 
 import java.io.Serializable;
 
@@ -24,6 +25,7 @@ public final class CobbleWriteContext implements Serializable {
     private final int writerCount;
     private final boolean overwrite;
     private final GlobalSnapshot baseSnapshot;
+    private final TableWritePlan catalogWritePlan;
 
     public CobbleWriteContext(
             CobbleOptions.CobbleTableConfig config,
@@ -31,13 +33,15 @@ public final class CobbleWriteContext implements Serializable {
             int totalBuckets,
             int writerCount,
             boolean overwrite,
-            GlobalSnapshot baseSnapshot) {
+            GlobalSnapshot baseSnapshot,
+            TableWritePlan catalogWritePlan) {
         this.config = config;
         this.schema = schema;
         this.totalBuckets = totalBuckets;
         this.writerCount = writerCount;
         this.overwrite = overwrite;
         this.baseSnapshot = baseSnapshot;
+        this.catalogWritePlan = catalogWritePlan;
     }
 
     public CobbleOptions.CobbleTableConfig config() {
@@ -66,5 +70,13 @@ public final class CobbleWriteContext implements Serializable {
      */
     public GlobalSnapshot baseSnapshot() {
         return baseSnapshot;
+    }
+
+    public boolean isCatalogTable() {
+        return catalogWritePlan != null;
+    }
+
+    public TableWritePlan catalogWritePlan() {
+        return catalogWritePlan;
     }
 }

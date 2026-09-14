@@ -2,10 +2,32 @@ package io.cobble.spark;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.cobble.Config;
+import io.cobble.DbCoordinator;
+import io.cobble.GlobalSnapshot;
+import io.cobble.ShardSnapshot;
+import io.cobble.spark.write.CobbleShardResult;
+import io.cobble.spark.write.CobbleTableCommitter;
+import io.cobble.table.CatalogTable;
+import io.cobble.table.FileCatalog;
+import io.cobble.table.Table;
+import io.cobble.table.TableIdentifier;
+import io.cobble.table.TableSchema;
+import io.cobble.table.TableWritePlan;
+import io.cobble.table.Value;
 
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.write.LogicalWriteInfo;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -13,7 +35,11 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /** End-to-end tests for the filesystem-backed {@link SparkCatalog}. */
 public class SparkCatalogTest {
@@ -34,6 +60,7 @@ public class SparkCatalogTest {
                         .config("spark.driver.host", "127.0.0.1")
                         .config("spark.sql.catalog.cobble", "io.cobble.spark.SparkCatalog")
                         .config("spark.sql.catalog.cobble.path", warehouse.toUri().toString())
+                        .config("spark.sql.catalog.cobble.bucket", 4)
                         .getOrCreate();
     }
 
@@ -125,23 +152,18 @@ public class SparkCatalogTest {
     }
 
     @Test
-    public void renameRejectedAndDropTable() {
+    public void renameAndDropTable() {
         spark.sql("CREATE DATABASE cobble.db6");
         spark.sql(
                 "CREATE TABLE cobble.db6.t6 (id INT, v STRING) USING cobble"
                         + " OPTIONS ('primary-key'='id')");
         spark.sql("INSERT INTO cobble.db6.t6 VALUES (1, 'a')");
 
-        // Rename is not supported yet: moving the directory would break snapshot data paths.
-        assertThrows(
-                Exception.class,
-                () -> spark.sql("ALTER TABLE cobble.db6.t6 RENAME TO cobble.db6.t6b"));
-
-        // Original table is still intact and readable.
-        List<Row> rows = spark.sql("SELECT v FROM cobble.db6.t6").collectAsList();
+        spark.sql("ALTER TABLE cobble.db6.t6 RENAME TO cobble.db6.t6b");
+        List<Row> rows = spark.sql("SELECT v FROM cobble.db6.t6b").collectAsList();
         assertEquals(1, rows.size());
 
-        spark.sql("DROP TABLE cobble.db6.t6");
+        spark.sql("DROP TABLE cobble.db6.t6b");
         assertThrows(Exception.class, () -> spark.sql("SELECT * FROM cobble.db6.t6"));
     }
 
@@ -175,5 +197,231 @@ public class SparkCatalogTest {
         // No committed snapshot yet: a freshly created table reads as zero rows.
         assertEquals(0, spark.sql("SELECT * FROM cobble.dbEmpty.t").count());
         assertEquals(0, spark.read().table("cobble.dbEmpty.t").count());
+    }
+
+    @Test
+    public void nativeCreatedTableAcceptsSparkWriteAndRead() throws Exception {
+        TableIdentifier identifier = nativeIdentifier("native_created", "scores");
+        try (FileCatalog catalog = openNativeCatalog()) {
+            catalog.createNamespace(identifier.namespace());
+            try (CatalogTable table = catalog.createTable(identifier, nativeSchema())) {
+                assertTrue(table.tableId() > 0L);
+            }
+        }
+
+        spark.sql("INSERT INTO cobble.native_created.scores VALUES (1, 'one')");
+        assertEquals(
+                "one",
+                spark.sql("SELECT v FROM cobble.native_created.scores WHERE id = 1")
+                        .first()
+                        .getString(0));
+
+        try (FileCatalog catalog = openNativeCatalog();
+                CatalogTable table = catalog.loadTable(identifier);
+                DbCoordinator coordinator = table.coordinator(nativeRuntime())) {
+            assertNotNull(coordinator.loadCurrentGlobalSnapshot());
+        }
+    }
+
+    @Test
+    public void sparkCreatedTableIsVisibleToNativeCatalogAndIsolated() throws Exception {
+        spark.sql("CREATE DATABASE cobble.spark_native");
+        spark.sql(
+                "CREATE TABLE cobble.spark_native.left (id INT, v STRING) USING cobble"
+                        + " OPTIONS ('primary-key'='id')");
+        spark.sql(
+                "CREATE TABLE cobble.spark_native.right (id INT, v STRING) USING cobble"
+                        + " OPTIONS ('primary-key'='id')");
+        spark.sql("INSERT INTO cobble.spark_native.left VALUES (1, 'left')");
+        spark.sql("INSERT INTO cobble.spark_native.right VALUES (1, 'right')");
+
+        assertEquals(
+                "left",
+                spark.sql("SELECT v FROM cobble.spark_native.left WHERE id = 1")
+                        .first()
+                        .getString(0));
+        assertEquals(
+                "right",
+                spark.sql("SELECT v FROM cobble.spark_native.right WHERE id = 1")
+                        .first()
+                        .getString(0));
+
+        try (FileCatalog catalog = openNativeCatalog();
+                CatalogTable left = catalog.loadTable(nativeIdentifier("spark_native", "left"));
+                CatalogTable right = catalog.loadTable(nativeIdentifier("spark_native", "right"))) {
+            assertNotEquals(left.tableId(), right.tableId());
+            assertEquals(2, left.schema().fields().size());
+            assertEquals(2, right.schema().fields().size());
+        }
+    }
+
+    @Test
+    public void renameKeepsIdentityAndDropRecreateRejectsStaleCobbleTable() throws Exception {
+        SparkCatalog catalog = directCatalog();
+        String[] namespace = new String[] {"identity"};
+        catalog.createNamespace(namespace, Collections.emptyMap());
+        Identifier original = Identifier.of(namespace, "scores");
+        Identifier renamed = Identifier.of(namespace, "renamed_scores");
+        CobbleTable stale =
+                (CobbleTable)
+                        catalog.createTable(
+                                original,
+                                sparkSchema(),
+                                new org.apache.spark.sql.connector.expressions.Transform[0],
+                                primaryKeyProperties());
+        assertEquals("identity.scores", stale.name());
+
+        long originalId = nativeTableId("identity", "scores");
+        catalog.renameTable(original, renamed);
+        assertEquals(originalId, nativeTableId("identity", "renamed_scores"));
+        catalog.dropTable(renamed);
+        catalog.createTable(
+                original,
+                sparkSchema(),
+                new org.apache.spark.sql.connector.expressions.Transform[0],
+                primaryKeyProperties());
+        assertNotEquals(originalId, nativeTableId("identity", "scores"));
+
+        assertThrows(IllegalStateException.class, stale::schema);
+        assertThrows(
+                IllegalStateException.class,
+                () -> stale.newWriteBuilder(logicalWriteInfo()).build());
+    }
+
+    @Test
+    public void catalogStaleBaseCommitIsRejectedWithoutChangingCurrentSnapshot() throws Exception {
+        TableIdentifier identifier = nativeIdentifier("stale_commit", "scores");
+        CobbleOptions.CobbleTableConfig config;
+        TableWritePlan plan;
+        GlobalSnapshot base;
+        try (FileCatalog catalog = openNativeCatalog()) {
+            catalog.createNamespace(identifier.namespace());
+            try (CatalogTable table = catalog.createTable(identifier, nativeSchema())) {
+                config = catalogConfig(table);
+                plan = table.newWriteBuilder().totalBuckets(4).build();
+                ShardSnapshot initial = writeShard(plan, null, 1, "base");
+                try (io.cobble.table.TableSnapshotCommitter committer =
+                        table.snapshotCommitter(nativeRuntime(), 1)) {
+                    base = committer.commitBatch(1L, Collections.singletonList(initial));
+                }
+            }
+        }
+
+        ShardSnapshot advanced = writeShard(plan, base, 2, "advanced");
+        CobbleTableCommitter.commit(
+                config,
+                Collections.singletonList(new CobbleShardResult(4, 0, null, advanced)),
+                base,
+                false);
+        GlobalSnapshot current = CobbleTableRuntime.loadSnapshot(config);
+        assertTrue(current.id > base.id);
+
+        ShardSnapshot stale = writeShard(plan, base, 3, "stale");
+        assertThrows(
+                java.io.IOException.class,
+                () ->
+                        CobbleTableCommitter.commit(
+                                config,
+                                Collections.singletonList(new CobbleShardResult(4, 0, null, stale)),
+                                base,
+                                false));
+        assertEquals(current.id, CobbleTableRuntime.loadSnapshot(config).id);
+    }
+
+    private static Config nativeRuntime() {
+        return new Config().addVolume(warehouse.toUri().toString()).totalBuckets(4);
+    }
+
+    private static FileCatalog openNativeCatalog() {
+        return FileCatalog.open(nativeRuntime(), "cobble");
+    }
+
+    private static TableIdentifier nativeIdentifier(String namespace, String table) {
+        return new TableIdentifier(Collections.singletonList(namespace), table);
+    }
+
+    private static TableSchema nativeSchema() {
+        return CobbleTableSchema.fromStructType(sparkSchema(), Collections.singletonList("id"), 4)
+                .toTableSchema();
+    }
+
+    private static StructType sparkSchema() {
+        return DataTypes.createStructType(
+                new org.apache.spark.sql.types.StructField[] {
+                    DataTypes.createStructField("id", DataTypes.IntegerType, false),
+                    DataTypes.createStructField("v", DataTypes.StringType, true)
+                });
+    }
+
+    private static Map<String, String> primaryKeyProperties() {
+        Map<String, String> properties = new HashMap<>();
+        properties.put(CobbleOptions.PRIMARY_KEY, "id");
+        return properties;
+    }
+
+    private static SparkCatalog directCatalog() {
+        SparkCatalog catalog = new SparkCatalog();
+        Map<String, String> options = new HashMap<>();
+        options.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        options.put(CobbleOptions.BUCKET, "4");
+        catalog.initialize("cobble", new CaseInsensitiveStringMap(options));
+        return catalog;
+    }
+
+    private static long nativeTableId(String namespace, String table) {
+        try (FileCatalog catalog = openNativeCatalog();
+                CatalogTable nativeTable = catalog.loadTable(nativeIdentifier(namespace, table))) {
+            return nativeTable.tableId();
+        }
+    }
+
+    private static LogicalWriteInfo logicalWriteInfo() {
+        return new LogicalWriteInfo() {
+            @Override
+            public CaseInsensitiveStringMap options() {
+                return new CaseInsensitiveStringMap(Collections.emptyMap());
+            }
+
+            @Override
+            public String queryId() {
+                return "stale-catalog-table";
+            }
+
+            @Override
+            public StructType schema() {
+                return sparkSchema();
+            }
+        };
+    }
+
+    private static CobbleOptions.CobbleTableConfig catalogConfig(CatalogTable table) {
+        CobbleCatalogReference reference =
+                new CobbleCatalogReference(
+                        warehouse.toUri().toString(),
+                        "cobble",
+                        table.identifier().namespace(),
+                        table.identifier().name(),
+                        table.tableId(),
+                        table.catalogSchemaId(),
+                        table.schema());
+        Map<String, String> options = primaryKeyProperties();
+        options.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        options.put(CobbleOptions.BUCKET, "4");
+        return CobbleOptions.parse(options).withCatalogReference(reference);
+    }
+
+    private static ShardSnapshot writeShard(
+            TableWritePlan plan, GlobalSnapshot base, int id, String value) {
+        try (Table table =
+                base == null
+                        ? plan.writerBuilder(nativeRuntime())
+                                .bucketRanges(new int[] {0}, new int[] {3})
+                                .open()
+                        : plan.writerBuilder(nativeRuntime())
+                                .bucketRanges(new int[] {0}, new int[] {3})
+                                .openNewFromGlobalSnapshot(base)) {
+            table.put(Arrays.asList(Value.int32(id), Value.string(value)));
+            return table.snapshot();
+        }
     }
 }

@@ -1,5 +1,10 @@
 package io.cobble.spark;
 
+import io.cobble.Config;
+import io.cobble.table.CatalogTable;
+import io.cobble.table.FileCatalog;
+import io.cobble.table.TableIdentifier;
+
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
@@ -13,42 +18,34 @@ import org.apache.spark.sql.connector.expressions.Transform;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 
 /**
- * Filesystem-backed Spark catalog for Cobble tables.
+ * Native Cobble-backed Spark catalog.
  *
  * <p>Register with {@code spark.sql.catalog.<name>=io.cobble.spark.SparkCatalog} and {@code
- * spark.sql.catalog.<name>.path=<warehouse>}. Each namespace is one directory and each table lives
- * under {@code <warehouse>/<database>/<table>}. A table directory contains the full table-level
- * properties ({@code cobble-table.properties}), so {@code CREATE TABLE}, {@code INSERT INTO} and
- * {@code SELECT} work without repeating the {@code path} option.
+ * spark.sql.catalog.<name>.path=<warehouse>}. Namespace and table registration is stored by
+ * Cobble's {@link FileCatalog}; Spark does not create sidecar metadata files.
  *
- * <p>Namespace and table names are validated and every resolved path is normalized and checked to
- * stay under the warehouse, so hostile identifiers cannot escape it. Tables are managed: a
- * user-supplied {@code path} option is overridden with the table directory, and {@code DROP TABLE}
- * removes that directory.
+ * <p>Names are validated before invoking the native catalog. Table locations and arbitrary table
+ * properties are intentionally unsupported because they are not durable catalog metadata.
  */
 public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
-    private static final String TABLE_PROPERTIES_FILE = "cobble-table.properties";
-    private static final String SPARK_SCHEMA_PROPERTY = "cobble.spark.schema-json";
     private static final String PROVIDER = "cobble";
 
     private String name;
     private Path warehouse;
+    private String storageId;
+    private int defaultBuckets;
+    private Map<String, String> runtimeDefaults;
 
     @Override
     public void initialize(String name, CaseInsensitiveStringMap options) {
@@ -68,6 +65,27 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         this.warehouse =
                 Paths.get(java.net.URI.create(CobbleOptions.normalizePathUri(warehouseValue)))
                         .normalize();
+        validateCatalogOptions(options.asCaseSensitiveMap());
+        this.storageId = options.get("storage-id") == null ? "cobble" : options.get("storage-id");
+        if (storageId.trim().isEmpty()) {
+            throw new IllegalArgumentException("Cobble catalog storage-id must not be empty.");
+        }
+        this.runtimeDefaults = new HashMap<>(options.asCaseSensitiveMap());
+        this.runtimeDefaults.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        CobbleOptions.CobbleTableConfig runtimeConfig = CobbleOptions.parse(runtimeDefaults);
+        if (runtimeConfig.hasSnapshotId()) {
+            throw new IllegalArgumentException(
+                    "snapshot-id is a table operation option, not a catalog runtime option.");
+        }
+        if (runtimeConfig.snapshotRetention() > 0) {
+            throw new UnsupportedOperationException(
+                    "snapshot.retention is not supported for catalog tables.");
+        }
+        validateRuntimeMemoryBounds(runtimeConfig);
+        this.defaultBuckets =
+                runtimeConfig.hasBucketCount()
+                        ? runtimeConfig.bucketCount()
+                        : CobbleOptions.DEFAULT_BUCKET;
         try {
             Files.createDirectories(warehouse);
         } catch (IOException e) {
@@ -88,15 +106,14 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public String[][] listNamespaces() {
-        File[] dirs = warehouse.toFile().listFiles(File::isDirectory);
-        if (dirs == null) {
-            return new String[0][];
+        try (FileCatalog catalog = openNativeCatalog()) {
+            List<List<String>> namespaces = catalog.listNamespaces();
+            String[][] result = new String[namespaces.size()][];
+            for (int index = 0; index < namespaces.size(); index++) {
+                result[index] = namespaces.get(index).toArray(new String[0]);
+            }
+            return result;
         }
-        String[][] namespaces = new String[dirs.length][];
-        for (int i = 0; i < dirs.length; i++) {
-            namespaces[i] = new String[] {dirs[i].getName()};
-        }
-        return namespaces;
     }
 
     @Override
@@ -110,24 +127,19 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     public Map<String, String> loadNamespaceMetadata(String[] namespace)
             throws NoSuchNamespaceException {
         requireNoSuchNamespace(namespace);
-        Map<String, String> metadata = new HashMap<>();
-        metadata.put(TableCatalog.PROP_LOCATION, namespaceDir(namespace).toUri().toString());
-        metadata.put(TableCatalog.PROP_COMMENT, "Cobble namespace");
-        return metadata;
+        return java.util.Collections.emptyMap();
     }
 
     @Override
     public void createNamespace(String[] namespace, Map<String, String> metadata)
             throws NamespaceAlreadyExistsException {
-        Path dir = namespaceDir(namespace);
-        if (Files.exists(dir)) {
-            throw new NamespaceAlreadyExistsException(namespace);
-        }
-        try {
-            Files.createDirectories(dir);
-        } catch (IOException e) {
-            throw new IllegalStateException(
-                    "Failed to create namespace " + String.join(".", namespace), e);
+        requireNamespaceShape(namespace);
+        validateNamespaceMetadata(metadata);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (catalog.listNamespaces().contains(java.util.Arrays.asList(namespace))) {
+                throw new NamespaceAlreadyExistsException(namespace);
+            }
+            catalog.createNamespace(java.util.Arrays.asList(namespace));
         }
     }
 
@@ -145,27 +157,28 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             throws NoSuchNamespaceException,
                     org.apache.spark.sql.catalyst.analysis.NonEmptyNamespaceException {
         requireNoSuchNamespace(namespace);
-        File dir = namespaceDir(namespace).toFile();
-        File[] files = dir.listFiles();
-        if (files != null && files.length > 0) {
-            if (cascade) {
-                try {
-                    deleteRecursively(dir.toPath());
-                    return true;
-                } catch (IOException e) {
-                    throw new IllegalStateException(
-                            "Failed to drop namespace " + String.join(".", namespace), e);
-                }
-            }
-            throw new org.apache.spark.sql.catalyst.analysis.NonEmptyNamespaceException(namespace);
+        if (cascade) {
+            throw new UnsupportedOperationException(
+                    "CASCADE is not supported for the Cobble catalog; drop registered tables first.");
         }
-        return dir.delete();
+        try (FileCatalog catalog = openNativeCatalog()) {
+            List<TableIdentifier> tables = catalog.listTables(java.util.Arrays.asList(namespace));
+            if (!tables.isEmpty()) {
+                throw new org.apache.spark.sql.catalyst.analysis.NonEmptyNamespaceException(
+                        namespace);
+            }
+            catalog.dropNamespace(java.util.Arrays.asList(namespace));
+            return true;
+        }
     }
 
     @Override
     public boolean namespaceExists(String[] namespace) {
         try {
-            return Files.isDirectory(namespaceDir(namespace));
+            requireNamespaceShape(namespace);
+            try (FileCatalog catalog = openNativeCatalog()) {
+                return catalog.listNamespaces().contains(java.util.Arrays.asList(namespace));
+            }
         } catch (IllegalArgumentException e) {
             return false;
         }
@@ -174,40 +187,35 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     @Override
     public Identifier[] listTables(String[] namespace) throws NoSuchNamespaceException {
         requireNoSuchNamespace(namespace);
-        File dir = namespaceDir(namespace).toFile();
-        File[] tableDirs = dir.listFiles(File::isDirectory);
-        if (tableDirs == null) {
-            return new Identifier[0];
-        }
-        List<Identifier> identifiers = new ArrayList<>();
-        for (File tableDir : tableDirs) {
-            if (new File(tableDir, TABLE_PROPERTIES_FILE).isFile()) {
-                identifiers.add(Identifier.of(namespace, tableDir.getName()));
+        try (FileCatalog catalog = openNativeCatalog()) {
+            List<TableIdentifier> tables = catalog.listTables(java.util.Arrays.asList(namespace));
+            Identifier[] result = new Identifier[tables.size()];
+            for (int index = 0; index < tables.size(); index++) {
+                result[index] = Identifier.of(namespace, tables.get(index).name());
             }
+            return result;
         }
-        return identifiers.toArray(new Identifier[0]);
     }
 
     @Override
     public Table loadTable(Identifier ident) throws NoSuchTableException {
-        Path tableDir = tableDir(ident);
-        if (!Files.isDirectory(tableDir)) {
-            throw new NoSuchTableException(ident);
+        TableIdentifier identifier = nativeIdentifier(ident);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.tableExists(identifier)) {
+                throw new NoSuchTableException(ident);
+            }
+            try (CatalogTable table = catalog.loadTable(identifier)) {
+                return catalogTable(table);
+            }
         }
-        Map<String, String> properties = loadTableProperties(ident);
-        CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(properties);
-        String schemaJson = properties.get(SPARK_SCHEMA_PROPERTY);
-        StructType providedSchema =
-                schemaJson == null
-                        ? null
-                        : (StructType) org.apache.spark.sql.types.DataType.fromJson(schemaJson);
-        return new CobbleTable(config, providedSchema, properties);
     }
 
     @Override
     public boolean tableExists(Identifier ident) {
         try {
-            return Files.isRegularFile(tableDir(ident).resolve(TABLE_PROPERTIES_FILE));
+            try (FileCatalog catalog = openNativeCatalog()) {
+                return catalog.tableExists(nativeIdentifier(ident));
+            }
         } catch (IllegalArgumentException e) {
             return false;
         }
@@ -220,20 +228,29 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             Transform[] partitions,
             Map<String, String> properties)
             throws TableAlreadyExistsException, NoSuchNamespaceException {
-        Path tableDir = tableDir(ident);
-        if (Files.exists(tableDir)) {
-            throw new TableAlreadyExistsException(ident);
-        }
-        String db = effectiveNamespace(ident)[0];
+        TableIdentifier nativeIdentifier = nativeIdentifier(ident);
+        validateCreateOptions(partitions, properties);
 
         Map<String, String> tableProperties = new HashMap<>();
         if (properties != null) {
-            tableProperties.putAll(properties);
+            for (Map.Entry<String, String> entry : properties.entrySet()) {
+                String key = entry.getKey();
+                String normalizedKey =
+                        (key.regionMatches(true, 0, "option.", 0, "option.".length())
+                                        ? key.substring("option.".length())
+                                        : key)
+                                .toLowerCase(java.util.Locale.ROOT);
+                String previous = tableProperties.put(normalizedKey, entry.getValue());
+                if (previous != null && !previous.equals(entry.getValue())) {
+                    throw new IllegalArgumentException(
+                            "Conflicting CREATE TABLE options for '" + normalizedKey + "'.");
+                }
+            }
         }
         tableProperties.put(TableCatalog.PROP_PROVIDER, PROVIDER);
-        // Managed table: the path always points at the table directory, and DROP removes it.
-        tableProperties.put(TableCatalog.PROP_LOCATION, tableDir.toUri().toString());
-        tableProperties.put(CobbleOptions.PATH, tableDir.toUri().toString());
+        // Catalog-scoped writers use the warehouse as runtime storage; table identity remains
+        // exclusively in native catalog metadata.
+        tableProperties.put(CobbleOptions.PATH, warehouse.toUri().toString());
 
         // Validate everything before creating any directory, so a failed CREATE leaves nothing:
         // schema, primary key, and the full option set (bucket range, retention, write.tasks,
@@ -250,40 +267,30 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             throw new IllegalArgumentException(
                     "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
         }
+        CobbleTableSchema tableSchema;
         try {
-            CobbleTableSchema.fromStructType(
-                    effectiveSchema,
-                    primaryKeys,
-                    config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET);
+            tableSchema =
+                    CobbleTableSchema.fromStructType(
+                            effectiveSchema,
+                            primaryKeys,
+                            config.hasBucketCount() ? config.bucketCount() : defaultBuckets);
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException(
                     "Failed to create Cobble table " + ident.toString() + ": " + e.getMessage(), e);
         }
-        tableProperties.put(SPARK_SCHEMA_PROPERTY, effectiveSchema.json());
-
-        try {
-            Files.createDirectories(tableDir);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to create table " + ident.name(), e);
-        }
-        try {
-            storeTableProperties(tableDir, tableProperties);
-        } catch (IOException e) {
-            try {
-                deleteRecursively(tableDir);
-            } catch (IOException cleanup) {
-                // Preserve the original failure.
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.listNamespaces().contains(nativeIdentifier.namespace())) {
+                throw new NoSuchNamespaceException(
+                        nativeIdentifier.namespace().toArray(new String[0]));
             }
-            throw new IllegalArgumentException(
-                    "Failed to create Cobble table "
-                            + db
-                            + "."
-                            + ident.name()
-                            + ": "
-                            + e.getMessage(),
-                    e);
+            if (catalog.tableExists(nativeIdentifier)) {
+                throw new TableAlreadyExistsException(ident);
+            }
+            try (CatalogTable table =
+                    catalog.createTable(nativeIdentifier, tableSchema.toTableSchema())) {
+                return catalogTable(table);
+            }
         }
-        return new CobbleTable(config, effectiveSchema, tableProperties);
     }
 
     private static StructType forcePrimaryKeysNotNull(StructType schema, List<String> primaryKeys) {
@@ -309,6 +316,107 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         return org.apache.spark.sql.types.DataTypes.createStructType(updated);
     }
 
+    private FileCatalog openNativeCatalog() {
+        return FileCatalog.open(new Config().addVolume(warehouse.toUri().toString()), storageId);
+    }
+
+    private static void validateCatalogOptions(Map<String, String> options) {
+        for (String rawKey : options.keySet()) {
+            String key = rawKey.toLowerCase(java.util.Locale.ROOT);
+            if (!(CobbleOptions.PATH.equals(key)
+                    || "warehouse".equals(key)
+                    || "storage-id".equals(key)
+                    || CobbleOptions.BUCKET.equals(key)
+                    || CobbleOptions.WRITE_TASKS.equals(key)
+                    || CobbleOptions.WRITE_BUFFER_MEMORY.equals(key)
+                    || CobbleOptions.READ_BLOCK_CACHE_MEMORY.equals(key)
+                    || CobbleOptions.SNAPSHOT_RETENTION.equals(key))) {
+                throw new UnsupportedOperationException(
+                        "Unsupported Cobble catalog runtime option '" + rawKey + "'.");
+            }
+        }
+    }
+
+    private static void validateRuntimeMemoryBounds(CobbleOptions.CobbleTableConfig config) {
+        if (config.writeBufferMemoryBytes() <= 0L
+                || config.writeBufferMemoryBytes() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    CobbleOptions.WRITE_BUFFER_MEMORY
+                            + " must be in (0, "
+                            + Integer.MAX_VALUE
+                            + "] for the Cobble runtime.");
+        }
+        if (config.readBlockCacheBytes() < 0L || config.readBlockCacheBytes() > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    CobbleOptions.READ_BLOCK_CACHE_MEMORY
+                            + " must be in [0, "
+                            + Integer.MAX_VALUE
+                            + "] for the Cobble runtime.");
+        }
+    }
+
+    private TableIdentifier nativeIdentifier(Identifier ident) {
+        String[] namespace = effectiveNamespace(ident);
+        return new TableIdentifier(java.util.Collections.singletonList(namespace[0]), ident.name());
+    }
+
+    private CobbleTable catalogTable(CatalogTable table) {
+        CobbleCatalogReference reference =
+                new CobbleCatalogReference(
+                        warehouse.toUri().toString(),
+                        storageId,
+                        table.identifier().namespace(),
+                        table.identifier().name(),
+                        table.tableId(),
+                        table.catalogSchemaId(),
+                        table.schema());
+        Map<String, String> properties = new HashMap<>();
+        properties.putAll(runtimeDefaults);
+        properties.put(CobbleOptions.PATH, warehouse.toUri().toString());
+        properties.put(TableCatalog.PROP_PROVIDER, PROVIDER);
+        properties.put(CobbleOptions.BUCKET, Integer.toString(defaultBuckets));
+        return new CobbleTable(
+                CobbleOptions.parse(properties).withCatalogReference(reference),
+                CobbleTableSchema.fromTableSchema(table.schema(), defaultBuckets).toStructType(),
+                properties);
+    }
+
+    private void validateCreateOptions(Transform[] partitions, Map<String, String> properties) {
+        if (partitions != null && partitions.length > 0) {
+            throw new UnsupportedOperationException(
+                    "Cobble catalog does not support partition transforms.");
+        }
+        if (properties == null) return;
+        for (Map.Entry<String, String> entry : properties.entrySet()) {
+            String key = entry.getKey().toLowerCase(java.util.Locale.ROOT);
+            if (key.startsWith("option.")) key = key.substring("option.".length());
+            if (TableCatalog.PROP_LOCATION.equalsIgnoreCase(key)
+                    || CobbleOptions.PATH.equalsIgnoreCase(key)) {
+                throw new UnsupportedOperationException(
+                        "Cobble catalog stores table locations natively; LOCATION and path are unsupported.");
+            }
+            if (CobbleOptions.BUCKET.equalsIgnoreCase(key)
+                    && Integer.parseInt(entry.getValue()) != defaultBuckets) {
+                throw new IllegalArgumentException(
+                        "Catalog table bucket must equal the catalog default "
+                                + defaultBuckets
+                                + ".");
+            }
+            if (TableCatalog.PROP_PROVIDER.equalsIgnoreCase(key)
+                    && !PROVIDER.equalsIgnoreCase(entry.getValue())) {
+                throw new UnsupportedOperationException(
+                        "Cobble catalog only supports provider '" + PROVIDER + "'.");
+            }
+            if (!(CobbleOptions.PRIMARY_KEY.equalsIgnoreCase(key)
+                    || CobbleOptions.BUCKET.equalsIgnoreCase(key)
+                    || TableCatalog.PROP_PROVIDER.equalsIgnoreCase(key)
+                    || TableCatalog.PROP_OWNER.equalsIgnoreCase(key))) {
+                throw new UnsupportedOperationException(
+                        "Cobble catalog does not persist table property '" + entry.getKey() + "'.");
+            }
+        }
+    }
+
     @Override
     public Table alterTable(Identifier ident, TableChange... changes) throws NoSuchTableException {
         requireTableExists(ident);
@@ -318,41 +426,45 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
 
     @Override
     public boolean dropTable(Identifier ident) {
-        Path tableDir = tableDir(ident);
-        if (!Files.exists(tableDir)) {
-            return false;
-        }
-        try {
-            deleteRecursively(tableDir);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            TableIdentifier identifier = nativeIdentifier(ident);
+            if (!catalog.tableExists(identifier)) {
+                return false;
+            }
+            catalog.dropTable(identifier);
             return true;
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to drop table " + ident.name(), e);
         }
+    }
+
+    @Override
+    public boolean purgeTable(Identifier ident) {
+        throw new UnsupportedOperationException(
+                "PURGE is not supported for the Cobble catalog; DROP only unregisters the table.");
     }
 
     @Override
     public void renameTable(Identifier oldIdent, Identifier newIdent)
             throws NoSuchTableException, TableAlreadyExistsException {
-        requireTableExists(oldIdent);
-        // Moving the table directory would break the absolute data file paths recorded inside the
-        // committed snapshots, so renames are not supported yet.
-        throw new UnsupportedOperationException(
-                "ALTER TABLE ... RENAME is not supported for the Cobble catalog yet.");
+        TableIdentifier oldIdentifier = nativeIdentifier(oldIdent);
+        TableIdentifier newIdentifier = nativeIdentifier(newIdent);
+        if (!oldIdentifier.namespace().equals(newIdentifier.namespace())) {
+            throw new UnsupportedOperationException(
+                    "Cobble catalog rename must stay in one namespace.");
+        }
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.tableExists(oldIdentifier)) throw new NoSuchTableException(oldIdent);
+            if (catalog.tableExists(newIdentifier)) throw new TableAlreadyExistsException(newIdent);
+            try (CatalogTable ignored = catalog.renameTable(oldIdentifier, newIdentifier.name())) {
+                // The catalog owns the renamed table handle; Spark only needs the durable rename.
+            }
+        }
     }
 
-    private Path namespaceDir(String[] namespace) {
+    private static void requireNamespaceShape(String[] namespace) {
         if (namespace == null || namespace.length != 1) {
-            throw new IllegalArgumentException(
-                    "Cobble catalog supports single-level namespaces only, got "
-                            + (namespace == null ? "null" : String.join(".", namespace)));
+            throw new IllegalArgumentException("Cobble catalog supports one namespace level only.");
         }
         requireValidName(namespace[0], "database");
-        return resolveUnderWarehouse(warehouse.resolve(namespace[0]));
-    }
-
-    private Path tableDir(Identifier ident) {
-        String[] namespace = effectiveNamespace(ident);
-        return resolveUnderWarehouse(warehouse.resolve(namespace[0]).resolve(ident.name()));
     }
 
     /** Strips an optional catalog-name namespace prefix and validates a single-level namespace. */
@@ -392,76 +504,34 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
         }
     }
 
-    /** Normalizes and confirms the resolved path stays inside the warehouse. */
-    private Path resolveUnderWarehouse(Path resolved) {
-        Path normalized = resolved.normalize();
-        if (!normalized.startsWith(warehouse)) {
-            throw new IllegalArgumentException(
-                    "Cobble catalog path escapes the warehouse: " + resolved);
-        }
-        return normalized;
-    }
-
     private void requireNoSuchNamespace(String[] namespace) throws NoSuchNamespaceException {
-        if (namespace == null || namespace.length != 1) {
+        try {
+            requireNamespaceShape(namespace);
+        } catch (IllegalArgumentException e) {
             throw new NoSuchNamespaceException(namespace == null ? new String[0] : namespace);
         }
-        if (!Files.isDirectory(namespaceDir(namespace))) {
-            throw new NoSuchNamespaceException(namespace);
+        try (FileCatalog catalog = openNativeCatalog()) {
+            if (!catalog.listNamespaces().contains(java.util.Arrays.asList(namespace))) {
+                throw new NoSuchNamespaceException(namespace);
+            }
         }
     }
 
     private void requireTableExists(Identifier ident) throws NoSuchTableException {
-        if (!Files.isDirectory(tableDir(ident))) {
+        if (!tableExists(ident)) {
             throw new NoSuchTableException(ident);
         }
     }
 
-    private Map<String, String> loadTableProperties(Identifier ident) {
-        File propertiesFile = tableDir(ident).resolve(TABLE_PROPERTIES_FILE).toFile();
-        if (!propertiesFile.isFile()) {
-            throw new IllegalStateException(
-                    "Missing " + TABLE_PROPERTIES_FILE + " in table " + ident.toString());
-        }
-        Properties properties = new Properties();
-        try (FileInputStream input = new FileInputStream(propertiesFile)) {
-            properties.load(input);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to read " + propertiesFile, e);
-        }
-        Map<String, String> result = new HashMap<>();
-        for (String key : properties.stringPropertyNames()) {
-            result.put(key, properties.getProperty(key));
-        }
-        return result;
-    }
-
-    private static void storeTableProperties(Path tableDir, Map<String, String> properties)
-            throws IOException {
-        Properties stored = new Properties();
-        for (Map.Entry<String, String> entry : properties.entrySet()) {
-            stored.setProperty(entry.getKey(), entry.getValue());
-        }
-        File propertiesFile = tableDir.resolve(TABLE_PROPERTIES_FILE).toFile();
-        try (FileOutputStream output = new FileOutputStream(propertiesFile)) {
-            stored.store(output, "Cobble table properties");
-        }
-    }
-
-    private static void deleteRecursively(Path root) throws IOException {
-        if (!Files.exists(root)) {
+    private static void validateNamespaceMetadata(Map<String, String> metadata) {
+        if (metadata == null || metadata.isEmpty()) {
             return;
         }
-        try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
-            walk.sorted(Comparator.reverseOrder())
-                    .forEach(
-                            path -> {
-                                try {
-                                    Files.delete(path);
-                                } catch (IOException e) {
-                                    throw new IllegalStateException("Failed to delete " + path, e);
-                                }
-                            });
+        for (String key : metadata.keySet()) {
+            if (!TableCatalog.PROP_OWNER.equalsIgnoreCase(key)) {
+                throw new UnsupportedOperationException(
+                        "Cobble catalog does not persist namespace metadata: " + key);
+            }
         }
     }
 }
