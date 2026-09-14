@@ -14,6 +14,7 @@ import io.cobble.spark.write.CobbleTableCommitter;
 import io.cobble.table.ReadOnlyTable;
 import io.cobble.table.Table;
 import io.cobble.table.TableKey;
+import io.cobble.table.TableScanPlan;
 import io.cobble.table.TableSnapshotCommitter;
 import io.cobble.table.Value;
 
@@ -21,6 +22,10 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.read.InputPartition;
+import org.apache.spark.sql.connector.read.PartitionReader;
+import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
@@ -236,6 +241,46 @@ public class CobbleSparkReadWriteTest {
                 read.select("name", "id").orderBy("id").collectAsList().stream()
                         .map(r -> r.getString(0))
                         .collect(java.util.stream.Collectors.toList()));
+        // Spark pushes an empty required schema for count(*). The reader still needs a hidden
+        // existence column, but must not decode or expose a user column.
+        assertEquals(2L, read.selectExpr("count(*)").collectAsList().get(0).getLong(0));
+    }
+
+    @Test
+    public void tableScanPlanRemainsPinnedWhenDataIsAppended() throws Exception {
+        writeAndRead(Collections.singletonList(row(1, "before", "1.00", null, null, 0d)), 2, 1);
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(
+                        Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
+        GlobalSnapshot firstSnapshot = loadCurrentSnapshot(config);
+        TableScanPlan plan = CobbleTableRuntime.loadScanPlan(config, firstSnapshot);
+        CobbleTableSchema scanSchema =
+                CobbleTableSchema.fromTableSchema(plan.schema(), plan.totalBuckets());
+
+        writeAndRead(
+                Arrays.asList(
+                        row(1, "after", "2.00", null, null, 0d),
+                        row(2, "new", "3.00", null, null, 0d)),
+                2,
+                1);
+        assertTrue(loadCurrentSnapshot(config).id > plan.snapshotId());
+
+        CobbleBatch batch = new CobbleBatch(config, scanSchema, scanSchema.toStructType(), plan);
+        PartitionReaderFactory factory = batch.createReaderFactory();
+        List<Integer> ids = new java.util.ArrayList<Integer>();
+        List<String> names = new java.util.ArrayList<String>();
+        for (InputPartition partition : batch.planInputPartitions()) {
+            try (PartitionReader<InternalRow> reader = factory.createReader(partition)) {
+                while (reader.next()) {
+                    InternalRow row = reader.get();
+                    ids.add(Integer.valueOf(row.getInt(0)));
+                    names.add(row.getUTF8String(1).toString());
+                }
+            }
+        }
+        assertEquals(firstSnapshot.id, plan.snapshotId());
+        assertEquals(Collections.singletonList(Integer.valueOf(1)), ids);
+        assertEquals(Collections.singletonList("before"), names);
     }
 
     @Test

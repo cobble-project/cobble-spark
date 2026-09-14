@@ -1,8 +1,7 @@
 package io.cobble.spark;
 
-import io.cobble.GlobalSnapshot;
-import io.cobble.ScanPlan;
-import io.cobble.ScanSplit;
+import io.cobble.table.TableScanPlan;
+import io.cobble.table.TableScanSplit;
 
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.InputPartition;
@@ -18,27 +17,27 @@ public final class CobbleBatch implements Batch {
     private final CobbleOptions.CobbleTableConfig config;
     private final CobbleTableSchema schema;
     private final StructType requiredSchema;
-    private final GlobalSnapshot snapshot;
+    private final TableScanPlan scanPlan;
 
     public CobbleBatch(
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema schema,
             StructType requiredSchema,
-            GlobalSnapshot snapshot) {
+            TableScanPlan scanPlan) {
         this.config = config;
         this.schema = schema;
         this.requiredSchema = requiredSchema;
-        this.snapshot = snapshot;
+        this.scanPlan = scanPlan;
     }
 
     @Override
     public InputPartition[] planInputPartitions() {
-        List<ScanSplit> splits = ScanPlan.fromGlobalSnapshot(snapshot).splits();
+        if (scanPlan == null) {
+            return new InputPartition[0];
+        }
+        List<TableScanSplit> splits = scanPlan.splits();
         List<InputPartition> partitions = new ArrayList<>(splits.size());
-        for (ScanSplit split : splits) {
-            if (split == null || split.shard == null || split.shard.ranges == null) {
-                continue;
-            }
+        for (TableScanSplit split : splits) {
             partitions.add(new CobbleInputPartition(split, config, schema, requiredSchema));
         }
         return partitions.toArray(new InputPartition[0]);

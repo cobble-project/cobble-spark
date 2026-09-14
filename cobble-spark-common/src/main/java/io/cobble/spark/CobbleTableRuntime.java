@@ -2,11 +2,9 @@ package io.cobble.spark;
 
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
-import io.cobble.ReadOnlyDb;
-import io.cobble.ShardSnapshot;
-import io.cobble.table.ReadOnlyTable;
+import io.cobble.table.TableScanPlan;
 
-/** Loads snapshots and the authoritative native table schema embedded in each shard. */
+/** Loads committed snapshots and table-aware fixed scan plans. */
 public final class CobbleTableRuntime {
     public static final String TABLE_NAME = "data";
 
@@ -33,30 +31,20 @@ public final class CobbleTableRuntime {
 
     public static CobbleTableSchema loadSchema(
             CobbleOptions.CobbleTableConfig config, GlobalSnapshot snapshot) {
-        if (snapshot == null
-                || snapshot.shardSnapshots == null
-                || snapshot.shardSnapshots.isEmpty()) {
+        TableScanPlan plan = loadScanPlan(config, snapshot);
+        return CobbleTableSchema.fromTableSchema(plan.schema(), plan.totalBuckets());
+    }
+
+    public static TableScanPlan loadScanPlan(
+            CobbleOptions.CobbleTableConfig config, GlobalSnapshot snapshot) {
+        if (snapshot == null) {
             throw new IllegalArgumentException(
-                    "Cobble table " + config.pathUri() + " has no committed shard schema.");
+                    "Cobble table " + config.pathUri() + " has no committed snapshot.");
         }
-        ShardSnapshot shard = null;
-        for (ShardSnapshot candidate : snapshot.shardSnapshots) {
-            if (candidate != null) {
-                shard = candidate;
-                break;
-            }
-        }
-        if (shard == null) {
-            throw new IllegalArgumentException(
-                    "Cobble snapshot " + snapshot.id + " has no readable shard schema.");
-        }
-        try (ReadOnlyDb db =
-                        ReadOnlyDb.open(
-                                CobblePaths.createScanConfig(config, snapshot.totalBuckets, 1),
-                                shard.snapshotId,
-                                shard.dbId);
-                ReadOnlyTable table = ReadOnlyTable.open(db, TABLE_NAME)) {
-            return CobbleTableSchema.fromTableSchema(table.schema(), snapshot.totalBuckets);
-        }
+        CobbleLoader.ensureCobbleLoaded();
+        return TableScanPlan.forSnapshot(
+                CobblePaths.createScanConfig(config, snapshot.totalBuckets, 1),
+                TABLE_NAME,
+                snapshot.id);
     }
 }

@@ -1,6 +1,6 @@
 package io.cobble.spark;
 
-import io.cobble.GlobalSnapshot;
+import io.cobble.table.TableScanPlan;
 
 import org.apache.spark.sql.connector.read.Batch;
 import org.apache.spark.sql.connector.read.Scan;
@@ -16,17 +16,17 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
     private final CobbleOptions.CobbleTableConfig config;
     private final CobbleTableSchema schema;
     private final StructType requiredSchema;
-    private final GlobalSnapshot snapshot;
+    private final TableScanPlan scanPlan;
 
     public CobbleScan(
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema schema,
             StructType requiredSchema,
-            GlobalSnapshot snapshot) {
+            TableScanPlan scanPlan) {
         this.config = config;
         this.schema = schema;
         this.requiredSchema = requiredSchema;
-        this.snapshot = snapshot;
+        this.scanPlan = scanPlan;
     }
 
     @Override
@@ -36,19 +36,12 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     @Override
     public Batch toBatch() {
-        return new CobbleBatch(config, schema, requiredSchema, snapshot);
+        return new CobbleBatch(config, schema, requiredSchema, scanPlan);
     }
 
     @Override
     public Statistics estimateStatistics() {
-        long sizeBytes = 0L;
-        if (snapshot.shardSnapshots != null) {
-            for (io.cobble.ShardSnapshot shard : snapshot.shardSnapshots) {
-                if (shard != null) {
-                    sizeBytes += shard.dataSizeBytes;
-                }
-            }
-        }
+        long sizeBytes = scanPlan == null ? 0L : scanPlan.dataSizeBytes();
         final long sizeInBytes = Math.max(sizeBytes, 0L);
         return new Statistics() {
             @Override
@@ -65,6 +58,6 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     @Override
     public String description() {
-        return "Cobble scan snapshot=" + snapshot.id;
+        return "Cobble scan snapshot=" + (scanPlan == null ? 0L : scanPlan.snapshotId());
     }
 }

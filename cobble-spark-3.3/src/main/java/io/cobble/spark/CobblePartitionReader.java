@@ -1,9 +1,8 @@
 package io.cobble.spark;
 
 import io.cobble.ScanCursor;
-import io.cobble.ScanOptions;
-import io.cobble.ScanSplit;
 import io.cobble.table.KeyCodec;
+import io.cobble.table.TableScanSplit;
 import io.cobble.table.Value;
 import io.cobble.table.ValueCodec;
 
@@ -15,8 +14,9 @@ import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-import java.util.TreeSet;
 
 /**
  * Reads one scan split: opens the scan cursor on the executor, decodes the length framed key and
@@ -26,25 +26,24 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
 
     private static final int READ_AHEAD_BYTES = 1 << 20;
 
-    private final ScanSplit split;
+    private final TableScanSplit split;
     private final CobbleOptions.CobbleTableConfig config;
     private final CobbleTableSchema schema;
     private final StructType requiredSchema;
     // Projection mapping per required field: primary key slot (>= 0) or value column index (>= 0).
     private final io.cobble.table.LogicalType[] fieldTypes;
+    private final List<io.cobble.table.LogicalType> primaryKeyTypes;
     private final int[] fieldKeySlot;
-    private final int[] fieldValueIndex;
-    // Distinct value columns requested for the scan, ascending, and their entry positions.
-    private final int[] requestedValueColumns;
-    private final int[] positionByValueIndex;
+    // Entry-column positions for non-key fields, derived once from the projected semantic fields.
+    private final int[] fieldValuePosition;
+    private final List<String> projectedFields;
     private final boolean needsKey;
 
     private GenericInternalRow row;
     private ScanCursor cursor;
-    private ScanOptions scanOptions;
 
     public CobblePartitionReader(
-            ScanSplit split,
+            TableScanSplit split,
             CobbleOptions.CobbleTableConfig config,
             CobbleTableSchema schema,
             StructType requiredSchema) {
@@ -55,9 +54,12 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
 
         StructField[] required = requiredSchema.fields();
         this.fieldTypes = new io.cobble.table.LogicalType[required.length];
+        this.primaryKeyTypes = schema.primaryKeyTypes();
         this.fieldKeySlot = new int[required.length];
-        this.fieldValueIndex = new int[required.length];
-        TreeSet<Integer> requested = new TreeSet<>();
+        this.fieldValuePosition = new int[required.length];
+        String[] projectedNamesByValueIndex = new String[schema.valueColumnCount()];
+        int[] valueIndexByField = new int[required.length];
+        java.util.Arrays.fill(valueIndexByField, -1);
         boolean projectedKey = false;
         for (int i = 0; i < required.length; i++) {
             int ordinal = schema.ordinalOf(required[i].name());
@@ -66,29 +68,37 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
             if (keySlot >= 0) {
                 projectedKey = true;
                 fieldKeySlot[i] = keySlot;
-                fieldValueIndex[i] = -1;
+                fieldValuePosition[i] = -1;
             } else {
                 fieldKeySlot[i] = -1;
                 int valueIndex = schema.valueIndexForOrdinal(ordinal);
-                fieldValueIndex[i] = valueIndex;
-                requested.add(Integer.valueOf(valueIndex));
+                valueIndexByField[i] = valueIndex;
+                projectedNamesByValueIndex[valueIndex] = required[i].name();
             }
         }
         this.needsKey = projectedKey;
-        if (requested.isEmpty()) {
-            // The scan API requires at least one column; request column 0 and ignore it.
-            requested.add(Integer.valueOf(0));
-        }
-        this.requestedValueColumns = new int[requested.size()];
-        this.positionByValueIndex = new int[schema.valueColumnCount()];
+        List<String> names = new ArrayList<String>(projectedNamesByValueIndex.length);
+        int[] positionByValueIndex = new int[projectedNamesByValueIndex.length];
         java.util.Arrays.fill(positionByValueIndex, -1);
-        int position = 0;
-        for (Integer valueIndex : requested) {
-            requestedValueColumns[position] = valueIndex.intValue();
-            if (valueIndex.intValue() < positionByValueIndex.length) {
-                positionByValueIndex[valueIndex.intValue()] = position;
+        for (int valueIndex = 0; valueIndex < projectedNamesByValueIndex.length; valueIndex++) {
+            String name = projectedNamesByValueIndex[valueIndex];
+            if (name != null) {
+                positionByValueIndex[valueIndex] = names.size();
+                names.add(name);
             }
-            position++;
+        }
+        if (names.isEmpty()) {
+            // The table scan retains one internal value column for row existence on key-only and
+            // zero-column projections. It is intentionally not decoded by this reader.
+            projectedFields = Collections.singletonList(schema.primaryKeys().get(0));
+        } else {
+            projectedFields = Collections.unmodifiableList(names);
+        }
+        for (int i = 0; i < valueIndexByField.length; i++) {
+            int valueIndex = valueIndexByField[i];
+            if (valueIndex >= 0) {
+                fieldValuePosition[i] = positionByValueIndex[valueIndex];
+            }
         }
     }
 
@@ -106,8 +116,8 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         }
         List<Value> keyValues =
                 needsKey
-                        ? KeyCodec.decode(schema.primaryKeyTypes(), ByteBuffer.wrap(entry.key))
-                        : java.util.Collections.emptyList();
+                        ? KeyCodec.decode(primaryKeyTypes, ByteBuffer.wrap(entry.key))
+                        : Collections.emptyList();
         for (int i = 0; i < fieldKeySlot.length; i++) {
             Object value;
             if (fieldKeySlot[i] >= 0) {
@@ -115,12 +125,11 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
                         CobbleSparkRowConverter.toSparkInternal(
                                 fieldTypes[i], keyValues.get(fieldKeySlot[i]));
             } else {
-                int valueIndex = fieldValueIndex[i];
-                int position = positionByValueIndex[valueIndex];
+                int position = fieldValuePosition[i];
                 if (position < 0) {
                     throw new IOException(
-                            "Cobble value column "
-                                    + valueIndex
+                            "Cobble value field at output position "
+                                    + i
                                     + " was not requested in the scan.");
                 }
                 Value decoded =
@@ -139,16 +148,13 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
         if (totalBuckets <= 0) {
             throw new IOException("Cobble native table schema has no bucket count.");
         }
-        scanOptions =
-                ScanOptions.forColumns(requestedValueColumns)
-                        .columnFamily(CobbleTableRuntime.TABLE_NAME)
-                        .readAheadBytes(READ_AHEAD_BYTES);
         try {
             cursor =
-                    split.openScannerWithOptions(
+                    split.openScanner(
                             CobblePaths.createScanConfig(
                                     config, totalBuckets, schema.valueColumnCount()),
-                            scanOptions);
+                            projectedFields,
+                            READ_AHEAD_BYTES);
         } catch (RuntimeException e) {
             closeQuietly();
             throw new IOException(
@@ -174,17 +180,6 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
                 failure = new IOException("Failed to close Cobble scan cursor.", e);
             } finally {
                 cursor = null;
-            }
-        }
-        if (scanOptions != null) {
-            try {
-                scanOptions.close();
-            } catch (RuntimeException e) {
-                if (failure == null) {
-                    failure = new IOException("Failed to close Cobble scan options.", e);
-                }
-            } finally {
-                scanOptions = null;
             }
         }
         if (failure != null) {

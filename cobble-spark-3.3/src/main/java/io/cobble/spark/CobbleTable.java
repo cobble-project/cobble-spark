@@ -1,6 +1,7 @@
 package io.cobble.spark;
 
 import io.cobble.spark.write.CobbleWriteBuilder;
+import io.cobble.table.TableScanPlan;
 
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
@@ -73,8 +74,10 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
         CobbleOptions.CobbleTableConfig scanConfig = operationConfig(options.asCaseSensitiveMap());
         io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(scanConfig);
         CobbleTableSchema schema;
+        TableScanPlan scanPlan = null;
         if (snapshot != null) {
-            schema = CobbleTableRuntime.loadSchema(scanConfig, snapshot);
+            scanPlan = CobbleTableRuntime.loadScanPlan(scanConfig, snapshot);
+            schema = CobbleTableSchema.fromTableSchema(scanPlan.schema(), scanPlan.totalBuckets());
         } else if (providedSchema != null && !scanConfig.hasSnapshotId()) {
             List<String> primaryKeys =
                     CobbleTableSchema.parsePrimaryKeyOption(
@@ -89,7 +92,7 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
             throw new IllegalArgumentException(
                     "Cobble table " + scanConfig.pathUri() + " has no committed snapshot.");
         }
-        return new CobbleScanBuilder(scanConfig, schema);
+        return new CobbleScanBuilder(scanConfig, schema, scanPlan);
     }
 
     @Override
