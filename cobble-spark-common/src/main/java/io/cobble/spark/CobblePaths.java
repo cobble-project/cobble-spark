@@ -3,23 +3,17 @@ package io.cobble.spark;
 import io.cobble.Config;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
 
 /**
- * Builds the Cobble {@link Config}s used by writers, the coordinator and scan readers, and
- * maintains the writer-path index under the table root.
+ * Builds the Cobble {@link Config}s used by writers, the coordinator, and scan readers.
  *
- * <p>All configs target local tables: writer primary data, manifests and snapshots live under the
- * table root, with writers isolated by disjoint bucket ranges.
+ * <p>All configs target local tables. Table writers scope their own physical bucket directories;
+ * table-root metadata is reserved for global coordination.
  */
 public final class CobblePaths {
 
@@ -37,35 +31,18 @@ public final class CobblePaths {
         return new File(uri);
     }
 
-    /**
-     * Writer config for {@code writerIndex} owning an inclusive bucket range. Mirrors the proven
-     * Flink sink writer settings: WAL disabled because commits are snapshot based, snapshot chains
-     * tracked only for the latest snapshot, no block cache, vectorized memtable.
-     */
-    public static Config createWriterConfig(
-            CobbleOptions.CobbleTableConfig config,
-            int totalBuckets,
-            int writerIndex,
-            int writerCount) {
+    /** Runtime configuration for path-mode writers before the table builder scopes a bucket. */
+    public static Config createPathWriterRuntimeConfig(
+            CobbleOptions.CobbleTableConfig config, int totalBuckets, int memtableCapacity) {
+        if (memtableCapacity <= 0) {
+            throw new IllegalArgumentException("memtableCapacity must be positive");
+        }
         File localDir = tableRoot(config);
         mkdirs(localDir);
 
-        Config dbConfig = new Config().totalBuckets(totalBuckets);
-        dbConfig.walEnabled = false;
-        dbConfig.snapshotRetention = null;
-        dbConfig.snapshotOnlyTrack = true;
-        dbConfig.snapshotDisableIncrementalBaseLink = true;
-        dbConfig.memtableType = Config.MemtableType.VEC;
-        dbConfig.governanceMode = Config.GovernanceMode.NOOP;
-        dbConfig.logConsole = false;
-        dbConfig.logPath =
-                new File(localDir, "cobble-writer-" + writerIndex + ".log").getAbsolutePath();
-        dbConfig.blockCacheSize = 0;
-        dbConfig.blockCacheHybridEnabled = false;
-        dbConfig.blockCacheHybridDiskSize = 0;
-        dbConfig.memtableCapacity =
-                positiveInt(config.writeBufferMemoryBytes(), CobbleOptions.WRITE_BUFFER_MEMORY);
-        dbConfig.memtableBufferCount = 1;
+        Config dbConfig = createWriterRuntimeConfig(totalBuckets, memtableCapacity);
+        dbConfig.dataFileType = config.dataFileType();
+        dbConfig.logPath = new File(localDir, "cobble-writer.log").getAbsolutePath();
 
         Config.VolumeDescriptor localVolume = new Config.VolumeDescriptor();
         localVolume.baseDir = localDir.getAbsolutePath();
@@ -73,14 +50,56 @@ public final class CobblePaths {
                 Collections.singletonList(Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
         dbConfig.addVolume(localVolume);
 
-        // Snapshot manifests are metadata; keeping META with SNAPSHOT keeps every shard snapshot
-        // complete under the table root.
         Config.VolumeDescriptor tableVolume = new Config.VolumeDescriptor();
-        tableVolume.baseDir = config.pathUri();
+        tableVolume.baseDir = localDir.getAbsolutePath();
         tableVolume.kinds =
                 Arrays.asList(Config.VolumeUsageKind.META, Config.VolumeUsageKind.SNAPSHOT);
         dbConfig.addVolume(tableVolume);
         return dbConfig;
+    }
+
+    /** Runtime settings for a writer before native code scopes its persistent volumes. */
+    public static Config createWriterRuntimeConfig(int totalBuckets, int memtableCapacity) {
+        if (memtableCapacity <= 0) {
+            throw new IllegalArgumentException("memtableCapacity must be positive");
+        }
+        Config config = new Config().totalBuckets(totalBuckets);
+        config.walEnabled = false;
+        config.snapshotRetention = null;
+        config.snapshotOnlyTrack = true;
+        config.snapshotDisableIncrementalBaseLink = true;
+        config.memtableType = Config.MemtableType.VEC;
+        config.governanceMode = Config.GovernanceMode.NOOP;
+        config.logConsole = false;
+        config.blockCacheSize = 0;
+        config.blockCacheHybridEnabled = false;
+        config.blockCacheHybridDiskSize = 0;
+        config.memtableCapacity = memtableCapacity;
+        config.memtableBufferCount = 1;
+        config.snapshotOnFlush = false;
+        config.activeMemtableIncrementalSnapshotRatio = 0.0d;
+        config.dataFileType = Config.DataFileType.PARQUET;
+        return config;
+    }
+
+    /** Divides one Spark task's write-buffer budget across its independently opened buckets. */
+    public static int perBucketWriteBuffer(
+            CobbleOptions.CobbleTableConfig config, int ownedBucketCount) {
+        if (ownedBucketCount <= 0) {
+            throw new IllegalArgumentException("ownedBucketCount must be positive");
+        }
+        long perBucket = config.writeBufferMemoryBytes() / ownedBucketCount;
+        if (perBucket < 1L || perBucket > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    "Configured "
+                            + CobbleOptions.WRITE_BUFFER_MEMORY
+                            + "="
+                            + config.writeBufferMemoryBytes()
+                            + " cannot provide a Java memtable capacity for each of "
+                            + ownedBucketCount
+                            + " owned buckets.");
+        }
+        return (int) perBucket;
     }
 
     /**
@@ -139,35 +158,6 @@ public final class CobblePaths {
         return scanConfig;
     }
 
-    /** Writer config scoped to an explicit writer path, used for snapshot pruning. */
-    public static Config createWriterConfigForPath(
-            CobbleOptions.CobbleTableConfig config, int totalBuckets, String writerPath) {
-        Config dbConfig = new Config().totalBuckets(totalBuckets);
-        dbConfig.governanceMode = Config.GovernanceMode.NOOP;
-        dbConfig.logConsole = false;
-
-        Config.VolumeDescriptor localVolume = new Config.VolumeDescriptor();
-        localVolume.baseDir = writerPath;
-        localVolume.kinds =
-                Collections.singletonList(Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
-        dbConfig.addVolume(localVolume);
-
-        Config.VolumeDescriptor tableVolume = new Config.VolumeDescriptor();
-        tableVolume.baseDir = config.pathUri();
-        tableVolume.kinds =
-                Arrays.asList(Config.VolumeUsageKind.META, Config.VolumeUsageKind.SNAPSHOT);
-        dbConfig.addVolume(tableVolume);
-        return dbConfig;
-    }
-
-    private static int positiveInt(long value, String optionKey) {
-        if (value <= 0L || value > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException(
-                    optionKey + " must be in (0, " + Integer.MAX_VALUE + "].");
-        }
-        return (int) value;
-    }
-
     private static int nonNegativeInt(long value, String optionKey) {
         if (value < 0L || value > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(
@@ -181,43 +171,6 @@ public final class CobblePaths {
             Files.createDirectories(dir.toPath());
         } catch (IOException e) {
             throw new IllegalStateException("Failed to create Cobble directory " + dir, e);
-        }
-    }
-
-    /** Serializable index mapping shard dbIds to writer paths for snapshot pruning. */
-    public static Map<String, String> loadWriterPathIndex(CobbleOptions.CobbleTableConfig config) {
-        File indexFile = new File(tableRoot(config), "writer-paths.properties");
-        Map<String, String> result = new HashMap<>();
-        if (!indexFile.exists()) {
-            return result;
-        }
-        Properties properties = new Properties();
-        try (FileInputStream input = new FileInputStream(indexFile)) {
-            properties.load(input);
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to read " + indexFile, e);
-        }
-        for (String name : properties.stringPropertyNames()) {
-            result.put(name, properties.getProperty(name));
-        }
-        return result;
-    }
-
-    public static void storeWriterPathIndex(
-            CobbleOptions.CobbleTableConfig config, Map<String, String> writerPathByDbId) {
-        File indexFile = new File(tableRoot(config), "writer-paths.properties");
-        File parent = indexFile.getParentFile();
-        if (parent != null) {
-            parent.mkdirs();
-        }
-        Properties properties = new Properties();
-        for (Map.Entry<String, String> entry : writerPathByDbId.entrySet()) {
-            properties.setProperty(entry.getKey(), entry.getValue());
-        }
-        try (FileOutputStream output = new FileOutputStream(indexFile)) {
-            properties.store(output, "Cobble writer path index by dbId");
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to write " + indexFile, e);
         }
     }
 }

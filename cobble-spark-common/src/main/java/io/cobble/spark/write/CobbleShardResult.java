@@ -4,21 +4,18 @@ import io.cobble.ShardSnapshot;
 
 import java.io.Serializable;
 
-/** Serializable result of one writer task: the shard snapshot it produced for the commit. */
+/** Serializable result of one logical bucket: the shard snapshot it produced for the commit. */
 public final class CobbleShardResult implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
     private final int totalBuckets;
-    private final int writerIndex;
-    private final String writerPath;
+    private final int bucketId;
     private final ShardSnapshot shardSnapshot;
 
-    public CobbleShardResult(
-            int totalBuckets, int writerIndex, String writerPath, ShardSnapshot shardSnapshot) {
+    public CobbleShardResult(int totalBuckets, int bucketId, ShardSnapshot shardSnapshot) {
         this.totalBuckets = totalBuckets;
-        this.writerIndex = writerIndex;
-        this.writerPath = writerPath;
+        this.bucketId = bucketId;
         this.shardSnapshot = shardSnapshot;
     }
 
@@ -26,12 +23,8 @@ public final class CobbleShardResult implements Serializable {
         return totalBuckets;
     }
 
-    public int writerIndex() {
-        return writerIndex;
-    }
-
-    public String writerPath() {
-        return writerPath;
+    public int bucketId() {
+        return bucketId;
     }
 
     public ShardSnapshot shardSnapshot() {
@@ -40,8 +33,8 @@ public final class CobbleShardResult implements Serializable {
 
     @Override
     public String toString() {
-        return "CobbleShardResult{writerIndex="
-                + writerIndex
+        return "CobbleShardResult{bucketId="
+                + bucketId
                 + ", totalBuckets="
                 + totalBuckets
                 + ", snapshotId="

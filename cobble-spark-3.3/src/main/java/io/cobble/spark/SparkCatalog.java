@@ -77,10 +77,6 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
             throw new IllegalArgumentException(
                     "snapshot-id is a table operation option, not a catalog runtime option.");
         }
-        if (runtimeConfig.snapshotRetention() > 0) {
-            throw new UnsupportedOperationException(
-                    "snapshot.retention is not supported for catalog tables.");
-        }
         validateRuntimeMemoryBounds(runtimeConfig);
         this.defaultBuckets =
                 runtimeConfig.hasBucketCount()
@@ -353,6 +349,7 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
                     || CobbleOptions.BUCKET.equals(key)
                     || CobbleOptions.WRITE_TASKS.equals(key)
                     || CobbleOptions.WRITE_BUFFER_MEMORY.equals(key)
+                    || CobbleOptions.DATA_FILE_TYPE.equals(key)
                     || CobbleOptions.READ_BLOCK_CACHE_MEMORY.equals(key)
                     || CobbleOptions.SNAPSHOT_RETENTION.equals(key))) {
                 throw new UnsupportedOperationException(
@@ -362,13 +359,11 @@ public final class SparkCatalog implements TableCatalog, SupportsNamespaces {
     }
 
     private static void validateRuntimeMemoryBounds(CobbleOptions.CobbleTableConfig config) {
-        if (config.writeBufferMemoryBytes() <= 0L
-                || config.writeBufferMemoryBytes() > Integer.MAX_VALUE) {
+        if (config.writeBufferMemoryBytes() <= 0L) {
             throw new IllegalArgumentException(
                     CobbleOptions.WRITE_BUFFER_MEMORY
-                            + " must be in (0, "
-                            + Integer.MAX_VALUE
-                            + "] for the Cobble runtime.");
+                            + " must be > 0; each task's per-bucket capacity is validated before"
+                            + " it opens native databases.");
         }
         if (config.readBlockCacheBytes() < 0L || config.readBlockCacheBytes() > Integer.MAX_VALUE) {
             throw new IllegalArgumentException(

@@ -1,9 +1,6 @@
 package io.cobble.spark.write;
 
-import io.cobble.Db;
-import io.cobble.ExpandStorageMode;
 import io.cobble.GlobalSnapshot;
-import io.cobble.PendingSnapshot;
 import io.cobble.ShardSnapshot;
 import io.cobble.spark.CobbleBucketMath;
 import io.cobble.spark.CobbleLoader;
@@ -11,162 +8,308 @@ import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleSparkRowConverter;
 import io.cobble.spark.CobbleTableRuntime;
-import io.cobble.spark.CobbleTableSchema;
+import io.cobble.table.CatalogTable;
+import io.cobble.table.FileCatalog;
 import io.cobble.table.Table;
 import io.cobble.table.Value;
 
 import org.apache.spark.sql.Row;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashMap;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Writes one Spark partition (one writer shard of the table) into a Cobble shard {@link Db} and
- * produces the shard snapshot for the driver-side commit.
- *
- * <p>Rows must already be partitioned so that every row's bucket falls into this writer's range.
- * When appending to an existing table the writer restores the covering shard snapshots first
- * (restore base manifest, shrink to the owned range, adopt overlapping ranges from other shards),
- * which also supports a changed writer count between jobs.
- */
-public final class CobbleShardWriteTask {
+import scala.Tuple2;
 
+/** Writes each task's contiguous assignment as independent one-bucket databases. */
+public final class CobbleShardWriteTask {
     private static final int INITIAL_KEY_BUFFER_BYTES = 4 * 1024;
     private static final int INITIAL_ROW_BUFFER_BYTES = 64 * 1024;
     private static final int MAX_BUFFER_CAPACITY = Integer.MAX_VALUE - 8;
 
     private CobbleShardWriteTask() {}
 
-    /** Writes all rows of one partition and returns a single {@link CobbleShardResult}. */
-    public static Iterator<CobbleShardResult> writeShard(
-            int writerIndex, Iterator<Row> rows, CobbleWriteContext context) throws IOException {
-        CobbleLoader.ensureCobbleLoaded();
-        CobbleOptions.CobbleTableConfig config = context.config();
-        CobbleTableSchema schema = context.schema();
-        int totalBuckets = context.totalBuckets();
-        int writerCount = context.writerCount();
-        int rangeStart = CobbleBucketMath.writerRangeStart(writerIndex, totalBuckets, writerCount);
-        int rangeEnd = CobbleBucketMath.writerRangeEnd(writerIndex, totalBuckets, writerCount);
-
-        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
-
-        if (context.isCatalogTable()) {
-            return writeCatalogShard(rows, context, rangeStart, rangeEnd, converter);
-        }
-
-        Db db = openWriter(context, writerIndex, rangeStart, rangeEnd);
-        try {
-            try (Table table =
-                    Table.create(db, CobbleTableRuntime.TABLE_NAME, schema.toTableSchema())) {
-                putRows(table, rows, converter);
-            }
-            PendingSnapshot<ShardSnapshot> pending = db.startAsyncSnapshot();
-            ShardSnapshot shardSnapshot;
-            try {
-                shardSnapshot = pending.future().get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while snapshotting Cobble shard", e);
-            } catch (java.util.concurrent.ExecutionException e) {
-                throw new IOException("Failed to snapshot Cobble shard", e.getCause());
-            }
-            String writerPath = CobblePaths.tableRoot(config).getAbsolutePath();
-            return Collections.singleton(
-                            new CobbleShardResult(
-                                    totalBuckets, writerIndex, writerPath, shardSnapshot))
-                    .iterator();
-        } finally {
-            db.close();
-        }
-    }
-
-    private static Iterator<CobbleShardResult> writeCatalogShard(
-            Iterator<Row> rows,
-            CobbleWriteContext context,
-            int rangeStart,
-            int rangeEnd,
-            CobbleSparkRowConverter converter)
+    public static Iterator<CobbleShardResult> writeBuckets(
+            int taskIndex, Iterator<Tuple2<Integer, Row>> rows, CobbleWriteContext context)
             throws IOException {
-        io.cobble.table.TableWriterBuilder builder =
-                context.catalogWritePlan()
-                        .writerBuilder(
-                                CobblePaths.createWriterConfig(
-                                        context.config(),
-                                        context.totalBuckets(),
-                                        rangeStart,
-                                        context.writerCount()))
-                        .bucketRanges(new int[] {rangeStart}, new int[] {rangeEnd});
-        try (Table table =
-                context.overwrite() || context.baseSnapshot() == null
-                        ? builder.open()
-                        : builder.openNewFromGlobalSnapshot(context.baseSnapshot())) {
-            putRows(table, rows, converter);
-            ShardSnapshot snapshot = table.snapshot();
-            return Collections.singleton(
-                            new CobbleShardResult(
-                                    context.totalBuckets(), rangeStart, null, snapshot))
-                    .iterator();
+        CobbleLoader.ensureCobbleLoaded();
+        int start =
+                CobbleBucketMath.writerRangeStart(
+                        taskIndex, context.totalBuckets(), context.writerCount());
+        int end =
+                CobbleBucketMath.writerRangeEnd(
+                        taskIndex, context.totalBuckets(), context.writerCount());
+        int count = end - start + 1;
+        int perBucketBuffer = CobblePaths.perBucketWriteBuffer(context.config(), count);
+        Map<Integer, ShardSnapshot> base =
+                baseByBucket(context.baseSnapshot(), context.totalBuckets());
+        verifyBaseStillCurrent(context);
+        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(context.schema());
+        DirectWriteBuffers buffers = new DirectWriteBuffers();
+        if (context.config().isCatalogTable()) {
+            return writeCatalogBuckets(
+                    rows, context, start, end, perBucketBuffer, base, converter, buffers);
+        }
+        return writeOpenedBuckets(
+                rows,
+                context,
+                start,
+                end,
+                bucket ->
+                        openPathBucket(
+                                context,
+                                bucket,
+                                perBucketBuffer,
+                                base.get(Integer.valueOf(bucket))),
+                converter,
+                buffers);
+    }
+
+    /** Reject a task launched after another writer has already published a different base. */
+    private static void verifyBaseStillCurrent(CobbleWriteContext context) throws IOException {
+        GlobalSnapshot current;
+        if (context.config().isCatalogTable()) {
+            current = CobbleTableRuntime.loadSnapshot(context.config());
+        } else {
+            try (io.cobble.DbCoordinator coordinator =
+                    io.cobble.DbCoordinator.open(
+                            CobblePaths.createCoordinatorConfig(
+                                    context.config(), Integer.valueOf(context.totalBuckets())))) {
+                current = coordinator.loadCurrentGlobalSnapshot();
+            }
+        }
+        GlobalSnapshot expected = context.baseSnapshot();
+        if ((expected == null && current != null)
+                || (expected != null && (current == null || current.id != expected.id))) {
+            throw new IOException("Cobble write task observed a stale committed base snapshot.");
         }
     }
 
-    /** Encodes each row into task-owned direct buffers before one native put call. */
-    private static void putRows(
-            Table table, Iterator<Row> rows, CobbleSparkRowConverter converter) {
-        if (!rows.hasNext()) {
-            return;
-        }
-        DirectWriteBuffers buffers = new DirectWriteBuffers();
-        while (rows.hasNext()) {
-            List<Value> values = converter.toValues(rows.next());
-            for (; ; ) {
-                try {
-                    table.putDirect(values, buffers.keyBuffer, buffers.rowBuffer);
-                    break;
-                } catch (BufferOverflowException overflow) {
-                    // Table.putDirect clears both buffers, encodes the ordered primary key first,
-                    // then encodes values. KeyCodec restores keyBuffer to position zero on an
-                    // encoding failure, while value encoding leaves the completed key intact.
-                    // Consequently this retry happens before JNI and grows only the buffer that
-                    // could not fit; a native failure is never retried.
-                    if (buffers.keyBuffer.position() == 0) {
-                        buffers.growKey(overflow);
-                    } else {
-                        buffers.growRow(overflow);
-                    }
+    /** Runs the shared row routing/snapshot lifecycle after a mode-specific bucket opener. */
+    private static Iterator<CobbleShardResult> writeOpenedBuckets(
+            Iterator<Tuple2<Integer, Row>> rows,
+            CobbleWriteContext context,
+            int start,
+            int end,
+            BucketOpener opener,
+            CobbleSparkRowConverter converter,
+            DirectWriteBuffers buffers)
+            throws IOException {
+        int count = end - start + 1;
+        Table[] writers = new Table[count];
+        Throwable primaryFailure = null;
+        try {
+            for (int bucket = start; bucket <= end; bucket++) {
+                writers[bucket - start] = opener.open(bucket);
+            }
+            // A task may have waited for another attempt's native bucket lock; reject a base
+            // superseded during that wait before it can write any rows.
+            verifyBaseStillCurrent(context);
+            while (rows.hasNext()) {
+                Tuple2<Integer, Row> pair = rows.next();
+                int bucket = pair._1().intValue();
+                int writerIndex = bucket - start;
+                if (writerIndex < 0 || writerIndex >= writers.length) {
+                    throw new IOException("Spark task received an unowned Cobble bucket " + bucket);
                 }
+                Table writer = writers[writerIndex];
+                put(writer, converter.toValues(pair._2()), buffers);
+            }
+            List<CobbleShardResult> results = new ArrayList<CobbleShardResult>(count);
+            for (int bucket = start; bucket <= end; bucket++) {
+                Table writer = writers[bucket - start];
+                results.add(
+                        new CobbleShardResult(context.totalBuckets(), bucket, writer.snapshot()));
+            }
+            return results.iterator();
+        } catch (IOException | RuntimeException | Error error) {
+            primaryFailure = error;
+            throw error;
+        } finally {
+            closeWriters(writers, primaryFailure);
+        }
+    }
+
+    private static Iterator<CobbleShardResult> writeCatalogBuckets(
+            Iterator<Tuple2<Integer, Row>> rows,
+            CobbleWriteContext context,
+            int start,
+            int end,
+            int perBucketBuffer,
+            Map<Integer, ShardSnapshot> base,
+            CobbleSparkRowConverter converter,
+            DirectWriteBuffers buffers)
+            throws IOException {
+        io.cobble.spark.CobbleCatalogReference reference = context.config().catalogReference();
+        try (FileCatalog catalog =
+                        FileCatalog.open(
+                                new io.cobble.Config().addVolume(reference.warehouse()),
+                                reference.storageId());
+                CatalogTable catalogTable = catalog.loadTable(reference.identifier())) {
+            reference.validate(catalogTable);
+            return writeOpenedBuckets(
+                    rows,
+                    context,
+                    start,
+                    end,
+                    bucket ->
+                            openCatalogBucket(
+                                    context,
+                                    catalogTable,
+                                    bucket,
+                                    perBucketBuffer,
+                                    base.get(Integer.valueOf(bucket))),
+                    converter,
+                    buffers);
+        }
+    }
+
+    private interface BucketOpener {
+        Table open(int bucket);
+    }
+
+    private static Table openPathBucket(
+            CobbleWriteContext context, int bucket, int perBucketBuffer, ShardSnapshot source) {
+        CobbleOptions.CobbleTableConfig options = context.config();
+        io.cobble.Config runtime =
+                CobblePaths.createPathWriterRuntimeConfig(
+                        options, context.totalBuckets(), perBucketBuffer);
+        io.cobble.table.TableWriterBuilder builder =
+                Table.writerBuilder(runtime)
+                        .tableName(CobbleTableRuntime.TABLE_NAME)
+                        .bucket(bucket);
+        Table table =
+                context.overwrite() || context.baseSnapshot() == null
+                        ? builder.create(context.schema().toTableSchema())
+                        : builder.resumeFromSnapshot(source.snapshotId);
+        if (!table.schema().equals(context.schema().toTableSchema())) {
+            table.close();
+            throw new IllegalStateException(
+                    "Cobble base shard schema does not match the write schema.");
+        }
+        return table;
+    }
+
+    private static Table openCatalogBucket(
+            CobbleWriteContext context,
+            CatalogTable catalogTable,
+            int bucket,
+            int perBucketBuffer,
+            ShardSnapshot source) {
+        io.cobble.Config runtime =
+                CobblePaths.createWriterRuntimeConfig(context.totalBuckets(), perBucketBuffer);
+        runtime.dataFileType = context.config().dataFileType();
+        io.cobble.Config.VolumeDescriptor primary = new io.cobble.Config.VolumeDescriptor();
+        primary.baseDir = context.config().catalogReference().warehouse();
+        primary.kinds =
+                Collections.singletonList(
+                        io.cobble.Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
+        runtime.addVolume(primary);
+        io.cobble.table.TableWriterBuilder builder =
+                catalogTable.writerBuilder(runtime).bucket(bucket);
+        return context.overwrite() || context.baseSnapshot() == null
+                ? builder.open()
+                : builder.resumeFromSnapshot(source.snapshotId);
+    }
+
+    /** Preserves a write/snapshot failure and adds close failures only as suppressed context. */
+    private static void closeWriters(Table[] writers, Throwable primaryFailure) throws IOException {
+        IOException failure = null;
+        for (Table writer : writers) {
+            if (writer == null) continue;
+            try {
+                writer.close();
+            } catch (RuntimeException error) {
+                if (failure == null)
+                    failure = new IOException("Failed to close Cobble bucket", error);
+                else failure.addSuppressed(error);
+            }
+        }
+        if (failure != null) {
+            if (primaryFailure != null) primaryFailure.addSuppressed(failure);
+            else throw failure;
+        }
+    }
+
+    /** Rejects legacy multi-bucket snapshots instead of reassembling or shrinking them. */
+    static Map<Integer, ShardSnapshot> baseByBucket(GlobalSnapshot snapshot, int totalBuckets)
+            throws IOException {
+        Map<Integer, ShardSnapshot> result = new HashMap<Integer, ShardSnapshot>();
+        if (snapshot == null) return result;
+        if (snapshot.totalBuckets != totalBuckets || snapshot.shardSnapshots == null) {
+            throw new IOException("Cobble base snapshot has an incompatible bucket layout.");
+        }
+        for (ShardSnapshot shard : snapshot.shardSnapshots) {
+            if (shard == null || shard.ranges == null || shard.ranges.size() != 1) {
+                throw new IOException("Cobble base snapshot must contain one shard per bucket.");
+            }
+            ShardSnapshot.Range range = shard.ranges.get(0);
+            if (range == null
+                    || range.start != range.end
+                    || range.start < 0
+                    || range.start >= totalBuckets) {
+                throw new IOException("Cobble base snapshot contains a legacy multi-bucket shard.");
+            }
+            if (!("bucket-" + range.start).equals(shard.dbId)) {
+                throw new IOException(
+                        "Cobble base snapshot shard has an unexpected database identity.");
+            }
+            if (result.put(Integer.valueOf(range.start), shard) != null) {
+                throw new IOException("Cobble base snapshot contains overlapping bucket shards.");
+            }
+        }
+        if (result.size() != totalBuckets) {
+            throw new IOException("Cobble base snapshot does not cover every bucket exactly once.");
+        }
+        return result;
+    }
+
+    private static void put(Table table, List<Value> values, DirectWriteBuffers buffers) {
+        for (; ; ) {
+            try {
+                table.putDirect(values, buffers.keyBuffer(), buffers.rowBuffer());
+                return;
+            } catch (BufferOverflowException overflow) {
+                if (buffers.keyBuffer().position() == 0) buffers.growKey(overflow);
+                else buffers.growRow(overflow);
             }
         }
     }
 
-    /** Small per-task direct-buffer owner. Buffers grow only when a legal row needs more space. */
     private static final class DirectWriteBuffers {
-        private ByteBuffer keyBuffer = ByteBuffer.allocateDirect(INITIAL_KEY_BUFFER_BYTES);
-        private ByteBuffer rowBuffer = ByteBuffer.allocateDirect(INITIAL_ROW_BUFFER_BYTES);
+        private ByteBuffer keyBuffer;
+        private ByteBuffer rowBuffer;
 
-        private void growKey(BufferOverflowException overflow) {
-            keyBuffer = grow(keyBuffer, "primary key", overflow);
+        private ByteBuffer keyBuffer() {
+            if (keyBuffer == null) keyBuffer = ByteBuffer.allocateDirect(INITIAL_KEY_BUFFER_BYTES);
+            return keyBuffer;
         }
 
-        private void growRow(BufferOverflowException overflow) {
-            rowBuffer = grow(rowBuffer, "row values", overflow);
+        private ByteBuffer rowBuffer() {
+            if (rowBuffer == null) rowBuffer = ByteBuffer.allocateDirect(INITIAL_ROW_BUFFER_BYTES);
+            return rowBuffer;
+        }
+
+        private void growKey(BufferOverflowException error) {
+            keyBuffer = grow(keyBuffer(), "primary key", error);
+        }
+
+        private void growRow(BufferOverflowException error) {
+            rowBuffer = grow(rowBuffer(), "row values", error);
         }
 
         private static ByteBuffer grow(
-                ByteBuffer current, String contents, BufferOverflowException overflow) {
+                ByteBuffer current, String contents, BufferOverflowException error) {
             int capacity = current.capacity();
             if (capacity >= MAX_BUFFER_CAPACITY) {
                 throw new IllegalArgumentException(
-                        "Cobble " + contents + " cannot fit in a Java direct ByteBuffer.",
-                        overflow);
+                        "Cobble " + contents + " cannot fit in a Java direct ByteBuffer.", error);
             }
             int next =
                     (int)
@@ -174,262 +317,6 @@ public final class CobbleShardWriteTask {
                                     MAX_BUFFER_CAPACITY,
                                     Math.max((long) capacity + 1L, (long) capacity * 2L));
             return ByteBuffer.allocateDirect(next);
-        }
-    }
-
-    private static Db openWriter(
-            CobbleWriteContext context, int writerIndex, int rangeStart, int rangeEnd)
-            throws IOException {
-        CobbleOptions.CobbleTableConfig config = context.config();
-        if (context.overwrite() || context.baseSnapshot() == null) {
-            // Overwrite publishes a fresh snapshot chain, and a brand new table has no prior
-            // state to restore; both never restore.
-            return Db.open(
-                    CobblePaths.createWriterConfig(
-                            config, context.totalBuckets(), writerIndex, context.writerCount()),
-                    rangeStart,
-                    rangeEnd);
-        }
-        return restoreRescaledDb(
-                context, writerIndex, context.baseSnapshot(), rangeStart, rangeEnd);
-    }
-
-    private static Db restoreRescaledDb(
-            CobbleWriteContext context,
-            int writerIndex,
-            GlobalSnapshot globalSnapshot,
-            int targetRangeStart,
-            int targetRangeEnd)
-            throws IOException {
-        List<RestoreSource> relevantSources =
-                collectRelevantSources(globalSnapshot, targetRangeStart, targetRangeEnd);
-        if (relevantSources.isEmpty()) {
-            throw new IOException(
-                    "Cobble writer "
-                            + writerIndex
-                            + " could not find any shard snapshot covering range ["
-                            + targetRangeStart
-                            + ", "
-                            + targetRangeEnd
-                            + "].");
-        }
-        ensureRestoreCoverage(relevantSources, targetRangeStart, targetRangeEnd);
-
-        RestoreSource baseSource = selectBaseSource(relevantSources);
-        Db db =
-                Db.restoreWithManifest(
-                        CobblePaths.createWriterConfig(
-                                context.config(),
-                                context.totalBuckets(),
-                                writerIndex,
-                                context.writerCount()),
-                        baseSource.shardSnapshot.manifestPath);
-        boolean success = false;
-        try {
-            shrinkBaseSourceToTargetRange(db, baseSource, targetRangeStart, targetRangeEnd);
-            for (RestoreSource source : relevantSources) {
-                if (source == baseSource) {
-                    continue;
-                }
-                materializeSourceSnapshotLocally(context, writerIndex, source.shardSnapshot);
-                int[] starts = new int[source.intersections.size()];
-                int[] ends = new int[source.intersections.size()];
-                for (int i = 0; i < source.intersections.size(); i++) {
-                    starts[i] = source.intersections.get(i).start;
-                    ends[i] = source.intersections.get(i).end;
-                }
-                db.expandBucket(
-                        source.shardSnapshot.dbId,
-                        source.shardSnapshot.snapshotId,
-                        starts,
-                        ends,
-                        ExpandStorageMode.ADOPT_ASYNC);
-            }
-            success = true;
-            return db;
-        } finally {
-            if (!success) {
-                db.close();
-            }
-        }
-    }
-
-    private static void materializeSourceSnapshotLocally(
-            CobbleWriteContext context, int writerIndex, ShardSnapshot sourceSnapshot)
-            throws IOException {
-        File localManifest =
-                new File(
-                        new File(
-                                new File(
-                                        CobblePaths.tableRoot(context.config()),
-                                        sourceSnapshot.dbId),
-                                "snapshot"),
-                        "SNAPSHOT-" + sourceSnapshot.snapshotId);
-        if (localManifest.exists()) {
-            return;
-        }
-        try (Db ignored =
-                Db.restoreWithManifest(
-                        CobblePaths.createWriterConfig(
-                                context.config(),
-                                context.totalBuckets(),
-                                writerIndex,
-                                context.writerCount()),
-                        sourceSnapshot.manifestPath)) {
-            // Materialize the source shard snapshot into this writer scope for expandBucket lookup.
-        }
-    }
-
-    private static List<RestoreSource> collectRelevantSources(
-            GlobalSnapshot globalSnapshot, int targetRangeStart, int targetRangeEnd) {
-        if (globalSnapshot == null || globalSnapshot.shardSnapshots == null) {
-            return Collections.emptyList();
-        }
-        Map<String, RestoreSource> byIdentity = new LinkedHashMap<>();
-        for (ShardSnapshot shardSnapshot : globalSnapshot.shardSnapshots) {
-            if (shardSnapshot == null
-                    || shardSnapshot.ranges == null
-                    || shardSnapshot.ranges.isEmpty()) {
-                continue;
-            }
-            String identity = snapshotIdentity(shardSnapshot);
-            for (ShardSnapshot.Range range : shardSnapshot.ranges) {
-                if (range == null) {
-                    continue;
-                }
-                int start = Math.max(range.start, targetRangeStart);
-                int end = Math.min(range.end, targetRangeEnd);
-                if (start > end) {
-                    continue;
-                }
-                RestoreSource source =
-                        byIdentity.computeIfAbsent(
-                                identity, ignored -> new RestoreSource(shardSnapshot));
-                source.intersections.add(new BucketRange(start, end));
-            }
-        }
-        List<RestoreSource> relevantSources = new ArrayList<>(byIdentity.values());
-        for (RestoreSource source : relevantSources) {
-            source.intersections.sort(Comparator.comparingInt(range -> range.start));
-        }
-        return relevantSources;
-    }
-
-    private static RestoreSource selectBaseSource(List<RestoreSource> restoreSources) {
-        RestoreSource baseSource = null;
-        int bestOverlap = -1;
-        for (RestoreSource source : restoreSources) {
-            int overlapSize = source.intersectionSize();
-            if (overlapSize > bestOverlap) {
-                bestOverlap = overlapSize;
-                baseSource = source;
-            }
-        }
-        return baseSource;
-    }
-
-    private static void shrinkBaseSourceToTargetRange(
-            Db db, RestoreSource baseSource, int targetRangeStart, int targetRangeEnd) {
-        List<Integer> starts = new ArrayList<>();
-        List<Integer> ends = new ArrayList<>();
-        for (ShardSnapshot.Range sourceRange : baseSource.shardSnapshot.ranges) {
-            if (sourceRange == null) {
-                continue;
-            }
-            if (sourceRange.start < targetRangeStart) {
-                int leftEnd = Math.min(sourceRange.end, targetRangeStart - 1);
-                if (sourceRange.start <= leftEnd) {
-                    starts.add(sourceRange.start);
-                    ends.add(leftEnd);
-                }
-            }
-            if (sourceRange.end > targetRangeEnd) {
-                int rightStart = Math.max(sourceRange.start, targetRangeEnd + 1);
-                if (rightStart <= sourceRange.end) {
-                    starts.add(rightStart);
-                    ends.add(sourceRange.end);
-                }
-            }
-        }
-        if (starts.isEmpty()) {
-            return;
-        }
-        db.shrinkBucket(
-                starts.stream().mapToInt(Integer::intValue).toArray(),
-                ends.stream().mapToInt(Integer::intValue).toArray());
-    }
-
-    private static void ensureRestoreCoverage(
-            List<RestoreSource> restoreSources, int targetRangeStart, int targetRangeEnd)
-            throws IOException {
-        List<BucketRange> ranges = new ArrayList<>();
-        for (RestoreSource source : restoreSources) {
-            ranges.addAll(source.intersections);
-        }
-        ranges.sort(
-                Comparator.comparingInt((BucketRange range) -> range.start)
-                        .thenComparingInt(range -> range.end));
-
-        int nextExpected = targetRangeStart;
-        for (BucketRange range : ranges) {
-            if (range.start > nextExpected) {
-                throw new IOException(
-                        "Cobble writer restore is missing shard coverage for bucket range ["
-                                + nextExpected
-                                + ", "
-                                + (range.start - 1)
-                                + "].");
-            }
-            nextExpected = Math.max(nextExpected, range.end + 1);
-            if (nextExpected > targetRangeEnd) {
-                return;
-            }
-        }
-        throw new IOException(
-                "Cobble writer restore is missing shard coverage for bucket range ["
-                        + nextExpected
-                        + ", "
-                        + targetRangeEnd
-                        + "].");
-    }
-
-    static String snapshotIdentity(ShardSnapshot shardSnapshot) {
-        return shardSnapshot.dbId
-                + "#"
-                + shardSnapshot.snapshotId
-                + "#"
-                + shardSnapshot.manifestPath;
-    }
-
-    private static final class RestoreSource {
-        private final ShardSnapshot shardSnapshot;
-        private final List<BucketRange> intersections = new ArrayList<>();
-
-        private RestoreSource(ShardSnapshot shardSnapshot) {
-            this.shardSnapshot = shardSnapshot;
-        }
-
-        private int intersectionSize() {
-            int total = 0;
-            for (BucketRange range : intersections) {
-                total += range.end - range.start + 1;
-            }
-            return total;
-        }
-    }
-
-    static final class BucketRange {
-        final int start;
-        final int end;
-
-        BucketRange(int start, int end) {
-            this.start = start;
-            this.end = end;
-        }
-
-        @Override
-        public String toString() {
-            return "[" + start + "-" + end + "]";
         }
     }
 }

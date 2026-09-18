@@ -1,5 +1,7 @@
 package io.cobble.spark;
 
+import io.cobble.Config;
+
 import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -29,16 +31,11 @@ public final class CobbleOptions {
 
     public static final String LATEST_SNAPSHOT = "latest";
 
-    /** Number of retained global snapshots after each write commit. */
-    public static final String SNAPSHOT_RETENTION = "snapshot.retention";
-
     /**
-     * Snapshot cleanup is disabled by default: scans resolve a snapshot on the driver and release
-     * the coordinator before executors open cursors, so an aggressive retention could delete files
-     * a running query still needs. Enable with an explicit {@code snapshot.retention > 0} once
-     * snapshots are leased.
+     * Unsupported snapshot cleanup option. Restored bucket databases can share files with older
+     * snapshots, so cleanup needs table-level, reference-aware garbage collection.
      */
-    public static final int DEFAULT_SNAPSHOT_RETENTION = 0;
+    public static final String SNAPSHOT_RETENTION = "snapshot.retention";
 
     /**
      * Number of writer tasks for a write job. Defaults to the Spark default parallelism, capped by
@@ -46,8 +43,10 @@ public final class CobbleOptions {
      */
     public static final String WRITE_TASKS = "write.tasks";
 
-    /** Per-writer memtable capacity in bytes. */
+    /** Total memtable budget in bytes for one Spark writer task, divided across its buckets. */
     public static final String WRITE_BUFFER_MEMORY = "write.buffer-memory";
+    /** Native data-file format; distinct from Spark's table provider format. */
+    public static final String DATA_FILE_TYPE = "data.file-type";
 
     public static final long DEFAULT_WRITE_BUFFER_MEMORY = 256L * 1024L * 1024L;
 
@@ -65,9 +64,9 @@ public final class CobbleOptions {
         private final String pathUri;
         private final Integer bucketCount;
         private final Long snapshotId;
-        private final int snapshotRetention;
         private final int writeTasks;
         private final long writeBufferMemoryBytes;
+        private final Config.DataFileType dataFileType;
         private final long readBlockCacheBytes;
         private final CobbleCatalogReference catalogReference;
 
@@ -75,17 +74,17 @@ public final class CobbleOptions {
                 String pathUri,
                 Integer bucketCount,
                 Long snapshotId,
-                int snapshotRetention,
                 int writeTasks,
                 long writeBufferMemoryBytes,
+                Config.DataFileType dataFileType,
                 long readBlockCacheBytes,
                 CobbleCatalogReference catalogReference) {
             this.pathUri = pathUri;
             this.bucketCount = bucketCount;
             this.snapshotId = snapshotId;
-            this.snapshotRetention = snapshotRetention;
             this.writeTasks = writeTasks;
             this.writeBufferMemoryBytes = writeBufferMemoryBytes;
+            this.dataFileType = dataFileType;
             this.readBlockCacheBytes = readBlockCacheBytes;
             this.catalogReference = catalogReference;
         }
@@ -116,16 +115,16 @@ public final class CobbleOptions {
             return snapshotId.longValue();
         }
 
-        public int snapshotRetention() {
-            return snapshotRetention;
-        }
-
         public int writeTasks() {
             return writeTasks;
         }
 
         public long writeBufferMemoryBytes() {
             return writeBufferMemoryBytes;
+        }
+
+        public Config.DataFileType dataFileType() {
+            return dataFileType;
         }
 
         public long readBlockCacheBytes() {
@@ -149,9 +148,9 @@ public final class CobbleOptions {
                     pathUri,
                     bucketCount,
                     snapshotId,
-                    snapshotRetention,
                     writeTasks,
                     writeBufferMemoryBytes,
+                    dataFileType,
                     readBlockCacheBytes,
                     Objects.requireNonNull(reference, "reference"));
         }
@@ -164,8 +163,6 @@ public final class CobbleOptions {
                     + bucketCount
                     + ", snapshotId="
                     + snapshotId
-                    + ", snapshotRetention="
-                    + snapshotRetention
                     + ", writeTasks="
                     + writeTasks
                     + "}";
@@ -227,13 +224,14 @@ public final class CobbleOptions {
             }
         }
 
-        int retention = DEFAULT_SNAPSHOT_RETENTION;
         String rawRetention = normalized.get(SNAPSHOT_RETENTION);
         if (rawRetention != null && !rawRetention.trim().isEmpty()) {
-            retention = parseIntOption(SNAPSHOT_RETENTION, rawRetention);
-            if (retention < 0) {
-                throw new IllegalArgumentException(
-                        SNAPSHOT_RETENTION + " must be >= 0, but was " + retention + ".");
+            int retention = parseIntOption(SNAPSHOT_RETENTION, rawRetention);
+            if (retention != 0) {
+                throw new UnsupportedOperationException(
+                        SNAPSHOT_RETENTION
+                                + " must be 0 until table-level garbage collection tracks files "
+                                + "shared across restored bucket databases.");
             }
         }
 
@@ -257,14 +255,27 @@ public final class CobbleOptions {
                         normalized.get(READ_BLOCK_CACHE_MEMORY),
                         DEFAULT_READ_BLOCK_CACHE_MEMORY,
                         READ_BLOCK_CACHE_MEMORY);
+        Config.DataFileType dataFileType = Config.DataFileType.PARQUET;
+        String rawFileType = normalized.get(DATA_FILE_TYPE);
+        if (rawFileType != null && !rawFileType.trim().isEmpty()) {
+            String value = rawFileType.trim().toLowerCase(java.util.Locale.ROOT);
+            if ("sst".equals(value)) dataFileType = Config.DataFileType.SST;
+            else if (!"parquet".equals(value)) {
+                throw new IllegalArgumentException(
+                        DATA_FILE_TYPE
+                                + " must be 'parquet' or 'sst', but was "
+                                + rawFileType
+                                + ".");
+            }
+        }
 
         return new CobbleTableConfig(
                 pathUri,
                 bucketCount,
                 snapshotId,
-                retention,
                 writeTasks,
                 writeBuffer,
+                dataFileType,
                 readCache,
                 null);
     }

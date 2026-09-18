@@ -154,10 +154,6 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
         if (!config.isCatalogTable()) {
             return operation;
         }
-        if (operation.snapshotRetention() > 0) {
-            throw new UnsupportedOperationException(
-                    "snapshot.retention is not supported for catalog tables.");
-        }
         return operation.withCatalogReference(config.catalogReference());
     }
 

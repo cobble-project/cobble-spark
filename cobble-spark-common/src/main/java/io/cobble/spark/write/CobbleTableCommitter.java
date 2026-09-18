@@ -3,7 +3,6 @@ package io.cobble.spark.write;
 import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.ShardSnapshot;
-import io.cobble.SnapshotTools;
 import io.cobble.spark.CobbleCommitLock;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
@@ -16,14 +15,13 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 
 /**
  * Driver-side commit of one write job: validates shard coverage, materializes the next global
- * snapshot through the native table committer and enforces snapshot retention.
+ * snapshot through the native table committer.
  */
 public final class CobbleTableCommitter {
 
@@ -32,16 +30,15 @@ public final class CobbleTableCommitter {
     /**
      * Commits all writer results and returns the materialized global snapshot.
      *
-     * <p>The commit is serialized per table via {@link CobbleCommitLock}. For appends, the writer
-     * tasks restore from {@code baseSnapshot} (pinned by the driver before they run); inside the
-     * lock the current snapshot is checked against that base, so a job that started from an
-     * already-superseded snapshot aborts instead of silently overwriting the newer commit.
+     * <p>The commit is serialized per table via {@link CobbleCommitLock}. Writer tasks use the
+     * {@code baseSnapshot} pinned by the driver before they run; inside the lock the current
+     * snapshot is checked against that base, so a job that started from an already-superseded
+     * snapshot aborts instead of silently overwriting the newer commit.
      */
     public static GlobalSnapshot commit(
             CobbleOptions.CobbleTableConfig config,
             List<CobbleShardResult> results,
-            GlobalSnapshot baseSnapshot,
-            boolean overwrite)
+            GlobalSnapshot baseSnapshot)
             throws IOException {
         CobbleLoader.ensureCobbleLoaded();
         if (results.isEmpty()) {
@@ -58,74 +55,42 @@ public final class CobbleTableCommitter {
                                 + ".");
             }
         }
+        validateBucketResults(results, totalBuckets);
         List<ShardSnapshot> shardSnapshots = new ArrayList<>(results.size());
         for (CobbleShardResult result : results) {
             shardSnapshots.add(result.shardSnapshot());
         }
-        String lockScope = config.isCatalogTable() ? catalogLockScope(config) : config.pathUri();
+        String lockScope = lockScope(config);
         try (CobbleCommitLock ignored = CobbleCommitLock.acquire(lockScope)) {
-            GlobalSnapshot latest;
             if (config.isCatalogTable()) {
-                latest = catalogCurrent(config, totalBuckets);
-            } else
-                try (DbCoordinator coordinator =
-                        DbCoordinator.open(
-                                CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
-                    latest = coordinator.loadCurrentGlobalSnapshot();
-                }
-            // Check the expected base before publishing any metadata in either storage mode.
-            if (!overwrite && !matchesBase(latest, baseSnapshot)) {
-                throw new IOException(
-                        "Cobble table "
-                                + config.pathUri()
-                                + " was modified concurrently: expected base snapshot "
-                                + describeSnapshot(baseSnapshot)
-                                + " but the current snapshot is "
-                                + describeSnapshot(latest)
-                                + ". Retry the write.");
+                return commitCatalog(config, totalBuckets, shardSnapshots, baseSnapshot);
             }
-
-            Map<String, String> writerPathByDbId = null;
-            if (!config.isCatalogTable()) {
-                String defaultWriterPath = CobblePaths.tableRoot(config).getAbsolutePath();
-                writerPathByDbId = CobblePaths.loadWriterPathIndex(config);
-                for (CobbleShardResult result : results) {
-                    String writerPath = result.writerPath();
-                    if (writerPath == null || writerPath.isEmpty()) writerPath = defaultWriterPath;
-                    writerPathByDbId.put(result.shardSnapshot().dbId, writerPath);
-                }
-                // Preserve the raw path-mode failure boundary: failure to record the durable
-                // writer location must occur before the native global snapshot is published.
-                CobblePaths.storeWriterPathIndex(config, writerPathByDbId);
+            GlobalSnapshot latest;
+            try (DbCoordinator coordinator =
+                    DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
+                latest = coordinator.loadCurrentGlobalSnapshot();
             }
+            requireBase(config, latest, baseSnapshot);
 
             long commitId = latest == null ? 0L : latest.id + 1L;
             GlobalSnapshot materialized;
-            if (config.isCatalogTable()) {
-                materialized = catalogCommit(config, totalBuckets, commitId, shardSnapshots);
-            } else
-                try (TableSnapshotCommitter committer =
-                        TableSnapshotCommitter.open(
-                                CobblePaths.createCoordinatorConfig(config, totalBuckets),
-                                totalBuckets,
-                                1)) {
-                    materialized = committer.commitBatch(commitId, shardSnapshots);
-                }
+            try (TableSnapshotCommitter committer =
+                    TableSnapshotCommitter.open(
+                            CobblePaths.createCoordinatorConfig(config, totalBuckets),
+                            totalBuckets,
+                            1)) {
+                materialized = committer.commitBatch(commitId, shardSnapshots);
+            }
             if (materialized == null) {
                 throw new IOException("Cobble table commit was unexpectedly superseded.");
             }
 
-            if (config.isCatalogTable()) {
-                return materialized;
-            }
-
-            try (DbCoordinator coordinator =
-                    DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
-                expireOlderSnapshots(
-                        config, totalBuckets, coordinator, materialized.id, writerPathByDbId);
-            }
             return materialized;
         }
+    }
+
+    static String lockScope(CobbleOptions.CobbleTableConfig config) throws IOException {
+        return config.isCatalogTable() ? catalogLockScope(config) : config.pathUri();
     }
 
     private static String catalogLockScope(CobbleOptions.CobbleTableConfig config)
@@ -142,42 +107,102 @@ public final class CobbleTableCommitter {
         return lockDir.toURI().toString();
     }
 
-    private static GlobalSnapshot catalogCurrent(
-            CobbleOptions.CobbleTableConfig config, int totalBuckets) {
-        io.cobble.spark.CobbleCatalogReference reference = config.catalogReference();
-        try (FileCatalog catalog =
-                        FileCatalog.open(
-                                new io.cobble.Config().addVolume(reference.warehouse()),
-                                reference.storageId());
-                CatalogTable table = catalog.loadTable(reference.identifier());
-                DbCoordinator coordinator =
-                        table.coordinator(
-                                CobblePaths.createWriterConfig(config, totalBuckets, 0, 1))) {
-            reference.validate(table);
-            return coordinator.loadCurrentGlobalSnapshot();
+    /** Enforces the physical one-database-per-bucket contract before publishing any metadata. */
+    private static void validateBucketResults(List<CobbleShardResult> results, int totalBuckets)
+            throws IOException {
+        if (results.size() != totalBuckets) {
+            throw new IOException(
+                    "Cobble write must produce exactly one result for each of "
+                            + totalBuckets
+                            + " buckets, but produced "
+                            + results.size()
+                            + ".");
+        }
+        Set<Integer> buckets = new HashSet<Integer>();
+        for (CobbleShardResult result : results) {
+            int bucket = result.bucketId();
+            ShardSnapshot snapshot = result.shardSnapshot();
+            if (bucket < 0
+                    || bucket >= totalBuckets
+                    || snapshot == null
+                    || snapshot.ranges == null
+                    || snapshot.ranges.size() != 1) {
+                throw new IOException("Cobble write result is not a valid single-bucket shard.");
+            }
+            ShardSnapshot.Range range = snapshot.ranges.get(0);
+            if (range == null || range.start != bucket || range.end != bucket) {
+                throw new IOException(
+                        "Cobble write result bucket "
+                                + bucket
+                                + " does not match its shard coverage.");
+            }
+            if (!("bucket-" + bucket).equals(snapshot.dbId)) {
+                throw new IOException(
+                        "Cobble write result bucket "
+                                + bucket
+                                + " must use stable database identity bucket-"
+                                + bucket
+                                + ".");
+            }
+            if (!buckets.add(Integer.valueOf(bucket))) {
+                throw new IOException(
+                        "Cobble write produced duplicate result for bucket " + bucket + ".");
+            }
         }
     }
 
-    private static GlobalSnapshot catalogCommit(
+    /** Loads and validates the catalog table once for both expected-base and publish operations. */
+    private static GlobalSnapshot commitCatalog(
             CobbleOptions.CobbleTableConfig config,
             int totalBuckets,
-            long commitId,
-            List<ShardSnapshot> snapshots) {
+            List<ShardSnapshot> snapshots,
+            GlobalSnapshot baseSnapshot)
+            throws IOException {
         io.cobble.spark.CobbleCatalogReference reference = config.catalogReference();
         try (FileCatalog catalog =
                         FileCatalog.open(
                                 new io.cobble.Config().addVolume(reference.warehouse()),
                                 reference.storageId());
-                CatalogTable table = catalog.loadTable(reference.identifier());
-                TableSnapshotCommitter committer =
-                        table.snapshotCommitter(
-                                CobblePaths.createWriterConfig(config, totalBuckets, 0, 1), 1)) {
+                CatalogTable table = catalog.loadTable(reference.identifier())) {
             reference.validate(table);
-            return committer.commitBatch(commitId, snapshots);
+            GlobalSnapshot latest;
+            try (DbCoordinator coordinator =
+                    table.coordinator(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
+                latest = coordinator.loadCurrentGlobalSnapshot();
+            }
+            requireBase(config, latest, baseSnapshot);
+            long commitId = latest == null ? 0L : latest.id + 1L;
+            try (TableSnapshotCommitter committer =
+                    table.snapshotCommitter(
+                            CobblePaths.createCoordinatorConfig(config, totalBuckets), 1)) {
+                GlobalSnapshot materialized = committer.commitBatch(commitId, snapshots);
+                if (materialized == null) {
+                    throw new IOException("Cobble table commit was unexpectedly superseded.");
+                }
+                return materialized;
+            }
         }
     }
 
-    /** True when the current snapshot is still the base this append job started from. */
+    /** Rejects a write that was planned against a snapshot no longer current. */
+    private static void requireBase(
+            CobbleOptions.CobbleTableConfig config,
+            GlobalSnapshot latest,
+            GlobalSnapshot baseSnapshot)
+            throws IOException {
+        if (!matchesBase(latest, baseSnapshot)) {
+            throw new IOException(
+                    "Cobble table "
+                            + config.pathUri()
+                            + " was modified concurrently: expected base snapshot "
+                            + describeSnapshot(baseSnapshot)
+                            + " but the current snapshot is "
+                            + describeSnapshot(latest)
+                            + ". Retry the write.");
+        }
+    }
+
+    /** True when the current snapshot is still the base this write job started from. */
     private static boolean matchesBase(GlobalSnapshot current, GlobalSnapshot expected) {
         if (expected == null) {
             return current == null;
@@ -187,54 +212,5 @@ public final class CobbleTableCommitter {
 
     private static String describeSnapshot(GlobalSnapshot snapshot) {
         return snapshot == null ? "none" : Long.toString(snapshot.id);
-    }
-
-    private static void expireOlderSnapshots(
-            CobbleOptions.CobbleTableConfig config,
-            int totalBuckets,
-            DbCoordinator coordinator,
-            long retainedSnapshotId,
-            Map<String, String> writerPathByDbId)
-            throws IOException {
-        if (config.snapshotRetention() <= 0) {
-            return;
-        }
-        List<GlobalSnapshot> snapshots = coordinator.listGlobalSnapshots();
-        Collections.sort(snapshots, Comparator.comparingLong(snapshot -> snapshot.id));
-
-        int toExpire = snapshots.size() - config.snapshotRetention();
-        for (GlobalSnapshot snapshot : snapshots) {
-            if (toExpire <= 0) {
-                break;
-            }
-            if (snapshot.id == retainedSnapshotId) {
-                continue;
-            }
-            for (ShardSnapshot shardSnapshot : snapshot.shardSnapshots) {
-                String writerPath = writerPathByDbId.get(shardSnapshot.dbId);
-                if (writerPath == null) {
-                    writerPath = CobblePaths.tableRoot(config).getAbsolutePath();
-                }
-                pruneWriterSnapshot(config, totalBuckets, shardSnapshot, writerPath);
-            }
-            coordinator.expireSnapshot(snapshot.id);
-            toExpire--;
-        }
-    }
-
-    private static void pruneWriterSnapshot(
-            CobbleOptions.CobbleTableConfig config,
-            int totalBuckets,
-            ShardSnapshot shardSnapshot,
-            String writerPath)
-            throws IOException {
-        try {
-            SnapshotTools.pruneShardSnapshot(
-                    CobblePaths.createWriterConfigForPath(config, totalBuckets, writerPath),
-                    shardSnapshot.dbId,
-                    shardSnapshot.snapshotId);
-        } catch (RuntimeException e) {
-            throw new IOException("Failed to prune Cobble shard snapshot", e);
-        }
     }
 }

@@ -2,16 +2,13 @@ package io.cobble.spark.write;
 
 import io.cobble.GlobalSnapshot;
 import io.cobble.spark.CobbleBucketMath;
-import io.cobble.spark.CobbleCatalogReference;
+import io.cobble.spark.CobbleCommitLock;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleSparkRowConverter;
 import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.spark.CobbleTableSchema;
-import io.cobble.table.CatalogTable;
-import io.cobble.table.FileCatalog;
-import io.cobble.table.TableWritePlan;
 
 import org.apache.spark.Partitioner;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -57,105 +54,114 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         CobbleLoader.ensureCobbleLoaded();
         boolean overwriteAll = overwrite || this.overwrite;
 
-        GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
-        CobbleTableSchema schema;
-        int totalBuckets;
-        if (config.isCatalogTable()) {
-            // A catalog relation captures the latest catalog schema on the driver. Its current
-            // data snapshot can legitimately embed an older schema, so never derive write
-            // encoding from that snapshot.
-            schema =
-                    CobbleTableSchema.fromTableSchema(
-                            config.catalogReference().schema(),
-                            currentSnapshot != null
-                                    ? currentSnapshot.totalBuckets
-                                    : (config.hasBucketCount()
-                                            ? config.bucketCount()
-                                            : CobbleOptions.DEFAULT_BUCKET));
-            schema.validateWriteSchema(data.schema());
-            validatePrimaryKeyOption(schema);
-            totalBuckets = schema.totalBuckets();
-        } else if (currentSnapshot != null) {
-            schema = CobbleTableRuntime.loadSchema(config, currentSnapshot);
-            schema.validateWriteSchema(data.schema());
-            validatePrimaryKeyOption(schema);
-            totalBuckets = schema.totalBuckets();
-        } else {
-            if (writeSchema == null) {
-                throw new IllegalArgumentException(
-                        "Creating a Cobble table requires a write schema.");
+        try (CobbleCommitLock ignored =
+                CobbleCommitLock.acquireWrite(CobbleTableCommitter.lockScope(config))) {
+
+            GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
+            CobbleTableSchema schema;
+            int totalBuckets;
+            if (config.isCatalogTable()) {
+                // A catalog relation captures the latest catalog schema on the driver. Its current
+                // data snapshot can legitimately embed an older schema, so never derive write
+                // encoding from that snapshot.
+                schema =
+                        CobbleTableSchema.fromTableSchema(
+                                config.catalogReference().schema(),
+                                currentSnapshot != null
+                                        ? currentSnapshot.totalBuckets
+                                        : (config.hasBucketCount()
+                                                ? config.bucketCount()
+                                                : CobbleOptions.DEFAULT_BUCKET));
+                schema.validateWriteSchema(data.schema());
+                validatePrimaryKeyOption(schema);
+                totalBuckets = schema.totalBuckets();
+            } else if (currentSnapshot != null) {
+                schema = CobbleTableRuntime.loadSchema(config, currentSnapshot);
+                schema.validateWriteSchema(data.schema());
+                validatePrimaryKeyOption(schema);
+                totalBuckets = schema.totalBuckets();
+            } else {
+                if (writeSchema == null) {
+                    throw new IllegalArgumentException(
+                            "Creating a Cobble table requires a write schema.");
+                }
+                String rawPrimaryKey = rawOptions.get(CobbleOptions.PRIMARY_KEY);
+                List<String> primaryKeys =
+                        CobbleTableSchema.parsePrimaryKeyOption(
+                                rawPrimaryKey == null ? "" : rawPrimaryKey);
+                totalBuckets =
+                        config.hasBucketCount()
+                                ? config.bucketCount()
+                                : CobbleOptions.DEFAULT_BUCKET;
+                schema = CobbleTableSchema.fromStructType(data.schema(), primaryKeys, totalBuckets);
             }
-            String rawPrimaryKey = rawOptions.get(CobbleOptions.PRIMARY_KEY);
-            List<String> primaryKeys =
-                    CobbleTableSchema.parsePrimaryKeyOption(
-                            rawPrimaryKey == null ? "" : rawPrimaryKey);
-            totalBuckets =
-                    config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
-            schema = CobbleTableSchema.fromStructType(data.schema(), primaryKeys, totalBuckets);
-        }
 
-        int writerCount =
-                Math.min(
-                        config.writeTasks() > 0
-                                ? config.writeTasks()
-                                : data.sparkSession().sparkContext().defaultParallelism(),
-                        totalBuckets);
-        if (writerCount <= 0) {
-            throw new IllegalStateException("Cobble writer count must be > 0.");
-        }
+            int writerCount =
+                    Math.min(
+                            config.writeTasks() > 0
+                                    ? config.writeTasks()
+                                    : data.sparkSession().sparkContext().defaultParallelism(),
+                            totalBuckets);
+            if (writerCount <= 0) {
+                throw new IllegalStateException("Cobble writer count must be > 0.");
+            }
+            for (int writer = 0; writer < writerCount; writer++) {
+                int start = CobbleBucketMath.writerRangeStart(writer, totalBuckets, writerCount);
+                int end = CobbleBucketMath.writerRangeEnd(writer, totalBuckets, writerCount);
+                CobblePaths.perBucketWriteBuffer(config, end - start + 1);
+            }
 
-        // Pin the base snapshot on the driver before any task runs: every writer restores from it
-        // and the commit verifies (under the lock) that the table still points at it, so two jobs
-        // starting from the same snapshot cannot overwrite each other's commit.
-        GlobalSnapshot baseSnapshot = null;
-        if (!overwriteAll) baseSnapshot = currentSnapshot;
+            // Pin the base snapshot on the driver before any task runs: every writer restores from
+            // it
+            // and the commit verifies (under the lock) that the table still points at it, so two
+            // jobs
+            // starting from the same snapshot cannot overwrite each other's commit.
+            GlobalSnapshot baseSnapshot = currentSnapshot;
+            if (baseSnapshot != null) {
+                try {
+                    CobbleShardWriteTask.baseByBucket(baseSnapshot, totalBuckets);
+                } catch (IOException invalidLayout) {
+                    throw new IllegalStateException(
+                            "Cobble table cannot append from a legacy or incomplete bucket snapshot.",
+                            invalidLayout);
+                }
+            }
 
-        TableWritePlan catalogWritePlan = null;
-        if (config.isCatalogTable()) {
-            catalogWritePlan = catalogWritePlan(config, totalBuckets);
-        }
+            final CobbleWriteContext context =
+                    new CobbleWriteContext(
+                            config, schema, totalBuckets, writerCount, overwriteAll, baseSnapshot);
+            final CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
+            final int buckets = totalBuckets;
+            final int writers = writerCount;
 
-        final CobbleWriteContext context =
-                new CobbleWriteContext(
-                        config,
-                        schema,
-                        totalBuckets,
-                        writerCount,
-                        overwriteAll,
-                        baseSnapshot,
-                        catalogWritePlan);
-        final CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
-        final int buckets = totalBuckets;
-        final int writers = writerCount;
+            JavaRDD<Row> rows = data.javaRDD();
+            JavaPairRDD<Integer, Row> byBucket =
+                    rows.mapToPair(
+                            (PairFunction<Row, Integer, Row>)
+                                    row -> {
+                                        int bucket = converter.bucket(row);
+                                        return new Tuple2<>(Integer.valueOf(bucket), row);
+                                    });
+            JavaRDD<CobbleShardResult> results =
+                    byBucket.partitionBy(new BucketTaskPartitioner(buckets, writers))
+                            .mapPartitionsWithIndex(
+                                    (Function2<
+                                                    Integer,
+                                                    Iterator<Tuple2<Integer, Row>>,
+                                                    Iterator<CobbleShardResult>>)
+                                            (index, partition) ->
+                                                    CobbleShardWriteTask.writeBuckets(
+                                                            index, partition, context),
+                                    true);
 
-        JavaRDD<Row> rows = data.javaRDD();
-        JavaPairRDD<Integer, Row> byWriter =
-                rows.mapToPair(
-                        (PairFunction<Row, Integer, Row>)
-                                row -> {
-                                    int bucket = converter.bucket(row);
-                                    int writerIndex =
-                                            CobbleBucketMath.writerIndexForBucket(
-                                                    bucket, buckets, writers);
-                                    return new Tuple2<>(Integer.valueOf(writerIndex), row);
-                                });
-        JavaRDD<CobbleShardResult> results =
-                byWriter.partitionBy(new IdentityPartitioner(writerCount))
-                        .mapPartitionsWithIndex(
-                                (Function2<
-                                                Integer,
-                                                Iterator<Tuple2<Integer, Row>>,
-                                                Iterator<CobbleShardResult>>)
-                                        (index, partition) ->
-                                                CobbleShardWriteTask.writeShard(
-                                                        index, toRowIterator(partition), context),
-                                true);
-
-        List<CobbleShardResult> shardResults = results.collect();
-        try {
-            CobbleTableCommitter.commit(config, shardResults, baseSnapshot, overwriteAll);
+            List<CobbleShardResult> shardResults = results.collect();
+            try {
+                CobbleTableCommitter.commit(config, shardResults, baseSnapshot);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to commit the Cobble write.", e);
+            }
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to commit the Cobble write.", e);
+            throw new IllegalStateException("Failed to acquire the Cobble table write lock.", e);
         }
     }
 
@@ -181,23 +187,6 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         }
     }
 
-    private static TableWritePlan catalogWritePlan(
-            CobbleOptions.CobbleTableConfig config, int totalBuckets) {
-        CobbleCatalogReference reference = config.catalogReference();
-        try (FileCatalog catalog =
-                        FileCatalog.open(
-                                new io.cobble.Config().addVolume(reference.warehouse()),
-                                reference.storageId());
-                CatalogTable table = catalog.loadTable(reference.identifier())) {
-            if (table.tableId() != reference.tableId()
-                    || table.catalogSchemaId() != reference.catalogSchemaId()) {
-                throw new IllegalStateException(
-                        "catalog table identity changed before write execution");
-            }
-            return table.newWriteBuilder().totalBuckets(totalBuckets).build();
-        }
-    }
-
     /** Rejects a supplied primary key option that disagrees with the stored table schema. */
     private void validatePrimaryKeyOption(CobbleTableSchema schema) {
         String rawPrimaryKey = rawOptions.get(CobbleOptions.PRIMARY_KEY);
@@ -219,50 +208,40 @@ public final class CobbleInsertableRelation implements InsertableRelation {
         }
     }
 
-    private static Iterator<Row> toRowIterator(Iterator<Tuple2<Integer, Row>> partition) {
-        return new Iterator<Row>() {
-            @Override
-            public boolean hasNext() {
-                return partition.hasNext();
-            }
-
-            @Override
-            public Row next() {
-                return partition.next()._2();
-            }
-        };
-    }
-
-    /** Routes each pre-computed writer index to itself, keeping bucket ranges contiguous. */
-    static final class IdentityPartitioner extends Partitioner {
+    /** Routes each logical bucket to its task's contiguous bucket assignment. */
+    static final class BucketTaskPartitioner extends Partitioner {
 
         private static final long serialVersionUID = 1L;
 
-        private final int partitions;
+        private final int totalBuckets;
+        private final int writers;
 
-        IdentityPartitioner(int partitions) {
-            this.partitions = partitions;
+        BucketTaskPartitioner(int totalBuckets, int writers) {
+            this.totalBuckets = totalBuckets;
+            this.writers = writers;
         }
 
         @Override
         public int numPartitions() {
-            return partitions;
+            return writers;
         }
 
         @Override
         public int getPartition(Object key) {
-            return ((Integer) key).intValue();
+            return CobbleBucketMath.writerIndexForBucket(
+                    ((Integer) key).intValue(), totalBuckets, writers);
         }
 
         @Override
         public boolean equals(Object other) {
-            return other instanceof IdentityPartitioner
-                    && ((IdentityPartitioner) other).partitions == partitions;
+            return other instanceof BucketTaskPartitioner
+                    && ((BucketTaskPartitioner) other).totalBuckets == totalBuckets
+                    && ((BucketTaskPartitioner) other).writers == writers;
         }
 
         @Override
         public int hashCode() {
-            return partitions;
+            return 31 * totalBuckets + writers;
         }
     }
 }

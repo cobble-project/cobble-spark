@@ -19,10 +19,9 @@ import io.cobble.table.FileCatalog;
 import io.cobble.table.Table;
 import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableSchema;
-import io.cobble.table.TableWritePlan;
-import io.cobble.table.Value;
 
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableChange;
@@ -37,6 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -294,39 +294,26 @@ public class SparkCatalogTest {
     public void catalogStaleBaseCommitIsRejectedWithoutChangingCurrentSnapshot() throws Exception {
         TableIdentifier identifier = nativeIdentifier("stale_commit", "scores");
         CobbleOptions.CobbleTableConfig config;
-        TableWritePlan plan;
         GlobalSnapshot base;
         try (FileCatalog catalog = openNativeCatalog()) {
             catalog.createNamespace(identifier.namespace());
             try (CatalogTable table = catalog.createTable(identifier, nativeSchema())) {
                 config = catalogConfig(table);
-                plan = table.newWriteBuilder().totalBuckets(4).build();
-                ShardSnapshot initial = writeShard(plan, null, 1, "base");
-                try (io.cobble.table.TableSnapshotCommitter committer =
-                        table.snapshotCommitter(nativeRuntime(), 1)) {
-                    base = committer.commitBatch(1L, Collections.singletonList(initial));
-                }
+                base =
+                        CobbleTableCommitter.commit(
+                                config, writeCatalogShards(config, null, 1, "base"), null);
             }
         }
 
-        ShardSnapshot advanced = writeShard(plan, base, 2, "advanced");
-        CobbleTableCommitter.commit(
-                config,
-                Collections.singletonList(new CobbleShardResult(4, 0, null, advanced)),
-                base,
-                false);
+        CobbleTableCommitter.commit(config, writeCatalogShards(config, base, 2, "advanced"), base);
         GlobalSnapshot current = CobbleTableRuntime.loadSnapshot(config);
         assertTrue(current.id > base.id);
 
-        ShardSnapshot stale = writeShard(plan, base, 3, "stale");
         assertThrows(
                 java.io.IOException.class,
                 () ->
                         CobbleTableCommitter.commit(
-                                config,
-                                Collections.singletonList(new CobbleShardResult(4, 0, null, stale)),
-                                base,
-                                false));
+                                config, writeCatalogShards(config, base, 3, "stale"), base));
         assertEquals(current.id, CobbleTableRuntime.loadSnapshot(config).id);
     }
 
@@ -623,18 +610,52 @@ public class SparkCatalogTest {
         return CobbleOptions.parse(options).withCatalogReference(reference);
     }
 
-    private static ShardSnapshot writeShard(
-            TableWritePlan plan, GlobalSnapshot base, int id, String value) {
-        try (Table table =
-                base == null
-                        ? plan.writerBuilder(nativeRuntime())
-                                .bucketRanges(new int[] {0}, new int[] {3})
-                                .open()
-                        : plan.writerBuilder(nativeRuntime())
-                                .bucketRanges(new int[] {0}, new int[] {3})
-                                .openNewFromGlobalSnapshot(base)) {
-            table.put(Arrays.asList(Value.int32(id), Value.string(value)));
-            return table.snapshot();
+    /** Produces one fresh, isolated database snapshot for every physical catalog bucket. */
+    private static List<CobbleShardResult> writeCatalogShards(
+            CobbleOptions.CobbleTableConfig config, GlobalSnapshot base, int id, String value) {
+        CobbleCatalogReference reference = config.catalogReference();
+        CobbleTableSchema schema = CobbleTableSchema.fromTableSchema(reference.schema(), 4);
+        Row row = RowFactory.create(id, value);
+        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
+        int valueBucket = converter.bucket(row);
+        List<CobbleShardResult> results = new ArrayList<CobbleShardResult>(4);
+        try (FileCatalog catalog =
+                        FileCatalog.open(
+                                new Config().addVolume(reference.warehouse()),
+                                reference.storageId());
+                CatalogTable catalogTable = catalog.loadTable(reference.identifier())) {
+            reference.validate(catalogTable);
+            for (int bucket = 0; bucket < 4; bucket++) {
+                Config runtime = CobblePaths.createWriterRuntimeConfig(4, 1);
+                runtime.dataFileType = config.dataFileType();
+                Config.VolumeDescriptor primary = new Config.VolumeDescriptor();
+                primary.baseDir = reference.warehouse();
+                primary.kinds =
+                        Collections.singletonList(
+                                Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
+                runtime.addVolume(primary);
+                ShardSnapshot source = base == null ? null : sourceForBucket(base, bucket);
+                try (Table table =
+                        source == null
+                                ? catalogTable.writerBuilder(runtime).bucket(bucket).open()
+                                : catalogTable
+                                        .writerBuilder(runtime)
+                                        .bucket(bucket)
+                                        .resumeFromSnapshot(source.snapshotId)) {
+                    if (bucket == valueBucket) table.put(converter.toValues(row));
+                    results.add(new CobbleShardResult(4, bucket, table.snapshot()));
+                }
+            }
         }
+        return results;
+    }
+
+    private static ShardSnapshot sourceForBucket(GlobalSnapshot snapshot, int bucket) {
+        for (ShardSnapshot shard : snapshot.shardSnapshots) {
+            if (shard.ranges.size() == 1
+                    && shard.ranges.get(0).start == bucket
+                    && shard.ranges.get(0).end == bucket) return shard;
+        }
+        throw new AssertionError("Missing single-bucket source shard " + bucket);
     }
 }
