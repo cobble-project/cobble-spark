@@ -16,6 +16,7 @@ spark.sql.catalog.cobble.storage-id=shared
 spark.sql.catalog.cobble.bucket=32
 spark.sql.catalog.cobble.write.tasks=4
 spark.sql.catalog.cobble.write.buffer-memory=32mb
+spark.sql.catalog.cobble.data.file-type=parquet
 ```
 
 `warehouse` is an alias for `path`. The current connector supports local
@@ -25,12 +26,37 @@ Spark default is `cobble`.
 
 Runtime settings belong on the catalog, not in persistent table properties.
 The configured bucket count applies to the first write; later writes use the
-committed table's bucket count. Changing writer parallelism redistributes bucket
-ownership, not the primary-key hash protocol.
+committed table's bucket count. Each bucket has its own Table/Db instance under
+`bucket-<id>`, which is also its stable database identity; there is no UUID
+directory beneath it. One Spark task manages multiple such instances. Changing writer
+parallelism only reassigns buckets to tasks, without merging or splitting Db
+contents or changing the primary-key hash protocol.
 
-Unknown runtime options are rejected. Catalog tables currently require
-`snapshot.retention=0` (the default): Spark does not run its standalone-path
-snapshot pruning against native catalog storage.
+Spark opens each bucket through the Table writer builder, which requires an
+explicit bucket ID and has no generic Db-ID or bucket-range mode. The Table layer owns
+bucket directory scoping, database creation/restoration, schema binding, and
+the underlying database lifetime. Spark only assigns buckets to tasks and
+supplies each bucket's runtime budget and committed snapshot boundary.
+
+`write.buffer-memory` is the budget for each Spark writer task. It is divided
+equally among that task's assigned buckets (rounded down to whole bytes), with
+one vector memtable buffer per Db and WAL disabled. Memtable binary snapshots
+are disabled: every snapshot flushes buffered writes into data files. Data files
+default to Parquet; set `data.file-type=sst` to select Cobble's SST format.
+These are Cobble-managed storage files, not a standalone Spark Parquet dataset.
+Native filenames can still end in `.sst`; the manifest records the actual format.
+This is a memtable budget, not a bound on all JVM/native memory.
+Each write attempt resumes the same database at its assigned committed snapshot,
+not the latest local snapshot left by an unfinished attempt. An empty baseline
+snapshot is retained for initial-write retries and overwrite. Historical snapshots
+remain readable, and subsequent file and snapshot identifiers do not rewind.
+
+Unknown runtime options are rejected. All Spark writes currently require
+`snapshot.retention=0` (the default), including standalone path-mode tables.
+Global snapshots reference bucket snapshots, including historical versions;
+the empty baseline must also remain available. Per-database snapshot pruning is
+not a safe table-level retention policy.
+Automatic expiration requires reference-aware table garbage collection.
 
 ```sql
 CREATE NAMESPACE cobble.app;
@@ -84,7 +110,7 @@ catalog. The corresponding Flink configuration uses `buckets`, not Spark's
 ```sql
 CREATE CATALOG cobble WITH (
     'type' = 'cobble',
-    'path' = '/shared/cobble-warehouse',
+    'path' = 'file:///shared/cobble-warehouse',
     'storage-id' = 'shared',
     'buckets' = '32'
 );
@@ -93,26 +119,38 @@ CREATE CATALOG cobble WITH (
 Both connectors use Cobble's table schema, key/value codecs and bucket protocol.
 No Spark-specific schema sidecar is required. Consumer modes and refresh behavior
 depend on the connector: this Spark implementation provides fixed batch scans,
-not a Structured Streaming source or sink.
+not a Structured Streaming source or sink. The current Flink native catalog
+source also supports batch reads only; it rejects `scan.mode=streaming`.
 
-Configure snapshot retention on every writer. Spark's `snapshot.retention=0`
-does not prevent a Flink writer from expiring historical global snapshots under
-its own retention policy.
+Configure retention on every writer. Spark requires `snapshot.retention=0`, but
+the current Flink sink requires a positive value and defaults to retaining one
+global snapshot. Spark's setting does not prevent Flink from expiring historical
+global snapshots. Choose a Flink retention large enough for the history your
+readers need; this is not an indefinite-retention or snapshot-lease guarantee.
 
-The current Flink catalog sink requires existing shard boundaries to match its
-configured `sink.parallelism`; changing the Flink environment's default
-parallelism alone does not set this connector option. When taking over a table
-last written by five Spark writers, use five Flink sink writers as well:
+With the single-bucket Table writer integration in both connectors, Spark and
+Flink can take turns updating the same table with different writer parallelism.
+Set Flink's `sink.parallelism` explicitly; changing only the environment default
+does not configure the catalog sink. For example:
 
 ```sql
-INSERT INTO cobble.app.purchases /*+ OPTIONS('sink.parallelism'='5') */
+INSERT INTO cobble.app.purchases
+/*+ OPTIONS('sink.parallelism'='5', 'snapshot.retention'='32') */
 SELECT id, amount, description FROM incoming_orders;
 ```
 
+Use an absolute `file:` URI for the current Flink catalog warehouse: a bare
+local path can create catalog metadata but fails when the sink opens a writer.
+Flink currently writes SST by default, whereas Spark defaults to Parquet;
+both connectors can read snapshots containing both file formats.
+
 ## Operational boundaries
 
-- Use one active writer across engines. Spark's commit lock and expected-base
-  check coordinate Spark commits, but do not constitute a shared Spark/Flink
+- Fixed-identity bucket writers require local/shared filesystem metadata storage
+  with working OS file locks. The bucket lock covers the database lifetime;
+  object-store distributed fencing is not implemented by this writer mode.
+- Use one active writer across engines. Spark's write lock, commit lock and expected-base
+  check coordinate Spark writes, but do not constitute a shared Spark/Flink
   transaction protocol. Perform schema changes, renames and drops while writers
   are stopped; stale-plan checks are not an atomic catalog-and-data transaction.
 - A scan is pinned to its planned snapshot. Appending after planning does not
@@ -127,3 +165,6 @@ SELECT id, amount, description FROM incoming_orders;
   `cobble-table.properties` directories are not imported or silently interpreted
   as native catalog tables. Standalone `format("cobble").load(path)` remains a
   separate non-catalog access mode.
+- Append rejects old snapshots with UUID database identities or multi-bucket shards. There is no
+  automatic migration or cross-shard bucket reassembly; use an explicit export
+  and rewrite when migrating existing data to the single-bucket layout.
