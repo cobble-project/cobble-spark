@@ -8,8 +8,6 @@ import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleSparkRowConverter;
 import io.cobble.spark.CobbleTableRuntime;
-import io.cobble.table.CatalogTable;
-import io.cobble.table.FileCatalog;
 import io.cobble.table.Table;
 import io.cobble.table.Value;
 
@@ -53,8 +51,19 @@ public final class CobbleShardWriteTask {
         CobbleSparkRowConverter converter = new CobbleSparkRowConverter(context.schema());
         DirectWriteBuffers buffers = new DirectWriteBuffers();
         if (context.config().isCatalogTable()) {
-            return writeCatalogBuckets(
-                    rows, context, start, end, perBucketBuffer, base, converter, buffers);
+            return writeOpenedBuckets(
+                    rows,
+                    context,
+                    start,
+                    end,
+                    bucket ->
+                            openCatalogBucket(
+                                    context,
+                                    bucket,
+                                    perBucketBuffer,
+                                    base.get(Integer.valueOf(bucket))),
+                    converter,
+                    buffers);
         }
         return writeOpenedBuckets(
                 rows,
@@ -74,15 +83,11 @@ public final class CobbleShardWriteTask {
     /** Reject a task launched after another writer has already published a different base. */
     private static void verifyBaseStillCurrent(CobbleWriteContext context) throws IOException {
         GlobalSnapshot current;
-        if (context.config().isCatalogTable()) {
-            current = CobbleTableRuntime.loadSnapshot(context.config());
-        } else {
-            try (io.cobble.DbCoordinator coordinator =
-                    io.cobble.DbCoordinator.open(
-                            CobblePaths.createCoordinatorConfig(
-                                    context.config(), Integer.valueOf(context.totalBuckets())))) {
-                current = coordinator.loadCurrentGlobalSnapshot();
-            }
+        try (io.cobble.DbCoordinator coordinator =
+                io.cobble.DbCoordinator.open(
+                        CobblePaths.createCoordinatorConfig(
+                                context.config(), Integer.valueOf(context.totalBuckets())))) {
+            current = coordinator.loadCurrentGlobalSnapshot();
         }
         GlobalSnapshot expected = context.baseSnapshot();
         if ((expected == null && current != null)
@@ -136,40 +141,6 @@ public final class CobbleShardWriteTask {
         }
     }
 
-    private static Iterator<CobbleShardResult> writeCatalogBuckets(
-            Iterator<Tuple2<Integer, Row>> rows,
-            CobbleWriteContext context,
-            int start,
-            int end,
-            int perBucketBuffer,
-            Map<Integer, ShardSnapshot> base,
-            CobbleSparkRowConverter converter,
-            DirectWriteBuffers buffers)
-            throws IOException {
-        io.cobble.spark.CobbleCatalogReference reference = context.config().catalogReference();
-        try (FileCatalog catalog =
-                        FileCatalog.open(
-                                new io.cobble.Config().addVolume(reference.warehouse()),
-                                reference.storageId());
-                CatalogTable catalogTable = catalog.loadTable(reference.identifier())) {
-            reference.validate(catalogTable);
-            return writeOpenedBuckets(
-                    rows,
-                    context,
-                    start,
-                    end,
-                    bucket ->
-                            openCatalogBucket(
-                                    context,
-                                    catalogTable,
-                                    bucket,
-                                    perBucketBuffer,
-                                    base.get(Integer.valueOf(bucket))),
-                    converter,
-                    buffers);
-        }
-    }
-
     private interface BucketOpener {
         Table open(int bucket);
     }
@@ -197,11 +168,7 @@ public final class CobbleShardWriteTask {
     }
 
     private static Table openCatalogBucket(
-            CobbleWriteContext context,
-            CatalogTable catalogTable,
-            int bucket,
-            int perBucketBuffer,
-            ShardSnapshot source) {
+            CobbleWriteContext context, int bucket, int perBucketBuffer, ShardSnapshot source) {
         io.cobble.Config runtime =
                 CobblePaths.createWriterRuntimeConfig(context.totalBuckets(), perBucketBuffer);
         runtime.dataFileType = context.config().dataFileType();
@@ -212,7 +179,7 @@ public final class CobbleShardWriteTask {
                         io.cobble.Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
         runtime.addVolume(primary);
         io.cobble.table.TableWriterBuilder builder =
-                catalogTable.writerBuilder(runtime).bucket(bucket);
+                context.catalogWritePlan().writerBuilder(runtime).bucket(bucket);
         return context.overwrite() || context.baseSnapshot() == null
                 ? builder.open()
                 : builder.resumeFromSnapshot(source.snapshotId);

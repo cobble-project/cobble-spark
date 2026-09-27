@@ -8,6 +8,7 @@ import io.cobble.table.FileCatalog;
 import io.cobble.table.TablePathRequest;
 import io.cobble.table.TableReader;
 import io.cobble.table.TableScanPlan;
+import io.cobble.table.TableWritePlan;
 
 /** Loads committed snapshots and table-aware fixed scan plans. */
 public final class CobbleTableRuntime {
@@ -48,6 +49,22 @@ public final class CobbleTableRuntime {
 
     public static boolean tableExists(CobbleOptions.CobbleTableConfig config) {
         return loadSnapshot(config) != null;
+    }
+
+    /** Captures the validated catalog definition on the driver for portable bucket writers. */
+    public static TableWritePlan buildWritePlan(
+            CobbleOptions.CobbleTableConfig config, int totalBuckets) {
+        if (!config.isCatalogTable()) {
+            throw new IllegalArgumentException("A catalog table is required for a write plan.");
+        }
+        CobbleLoader.ensureCobbleLoaded();
+        CobbleCatalogReference reference = config.catalogReference();
+        try (FileCatalog catalog =
+                        FileCatalog.open(catalogConfig(reference), reference.storageId());
+                CatalogTable table = catalog.loadTable(reference.identifier())) {
+            reference.validate(table);
+            return table.newWriteBuilder().totalBuckets(totalBuckets).build();
+        }
     }
 
     public static CobbleTableSchema loadSchema(

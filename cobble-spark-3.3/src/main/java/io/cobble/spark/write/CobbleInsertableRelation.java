@@ -9,6 +9,7 @@ import io.cobble.spark.CobblePaths;
 import io.cobble.spark.CobbleSparkRowConverter;
 import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.spark.CobbleTableSchema;
+import io.cobble.table.TableWritePlan;
 
 import org.apache.spark.Partitioner;
 import org.apache.spark.api.java.JavaPairRDD;
@@ -127,9 +128,19 @@ public final class CobbleInsertableRelation implements InsertableRelation {
                 }
             }
 
+            TableWritePlan catalogWritePlan =
+                    config.isCatalogTable()
+                            ? CobbleTableRuntime.buildWritePlan(config, totalBuckets)
+                            : null;
             final CobbleWriteContext context =
                     new CobbleWriteContext(
-                            config, schema, totalBuckets, writerCount, overwriteAll, baseSnapshot);
+                            config,
+                            schema,
+                            totalBuckets,
+                            writerCount,
+                            overwriteAll,
+                            baseSnapshot,
+                            catalogWritePlan);
             final CobbleSparkRowConverter converter = new CobbleSparkRowConverter(schema);
             final int buckets = totalBuckets;
             final int writers = writerCount;

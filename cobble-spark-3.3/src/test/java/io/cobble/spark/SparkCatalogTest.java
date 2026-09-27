@@ -13,12 +13,15 @@ import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.ShardSnapshot;
 import io.cobble.spark.write.CobbleShardResult;
+import io.cobble.spark.write.CobbleShardWriteTask;
 import io.cobble.spark.write.CobbleTableCommitter;
+import io.cobble.spark.write.CobbleWriteContext;
 import io.cobble.table.CatalogTable;
 import io.cobble.table.FileCatalog;
 import io.cobble.table.Table;
 import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableSchema;
+import io.cobble.table.TableWritePlan;
 
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -34,6 +37,10 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -315,6 +322,56 @@ public class SparkCatalogTest {
                         CobbleTableCommitter.commit(
                                 config, writeCatalogShards(config, base, 3, "stale"), base));
         assertEquals(current.id, CobbleTableRuntime.loadSnapshot(config).id);
+    }
+
+    @Test
+    public void serializedWritePlanOpensBucketsAfterCatalogRename() throws Exception {
+        TableIdentifier original = nativeIdentifier("portable_write", "before");
+        TableIdentifier renamed = nativeIdentifier("portable_write", "after");
+        CobbleOptions.CobbleTableConfig config;
+        try (FileCatalog catalog = openNativeCatalog()) {
+            catalog.createNamespace(original.namespace());
+            try (CatalogTable table = catalog.createTable(original, nativeSchema())) {
+                config = catalogConfig(table);
+            }
+        }
+
+        TableWritePlan plan = CobbleTableRuntime.buildWritePlan(config, 4);
+        CobbleWriteContext context =
+                new CobbleWriteContext(
+                        config,
+                        CobbleTableSchema.fromTableSchema(config.catalogReference().schema(), 4),
+                        4,
+                        2,
+                        false,
+                        null,
+                        plan);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+            output.writeObject(context);
+        }
+        try (FileCatalog catalog = openNativeCatalog()) {
+            try (CatalogTable ignored = catalog.renameTable(original, renamed.name())) {
+                // The worker must use the definition captured under the original name.
+            }
+        }
+        assertThrows(
+                IllegalStateException.class, () -> CobbleTableRuntime.buildWritePlan(config, 4));
+
+        CobbleWriteContext workerContext;
+        try (ObjectInputStream input =
+                new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            workerContext = (CobbleWriteContext) input.readObject();
+        }
+        List<CobbleShardResult> written = new ArrayList<CobbleShardResult>();
+        CobbleShardWriteTask.writeBuckets(
+                        0,
+                        Collections.<scala.Tuple2<Integer, Row>>emptyList().iterator(),
+                        workerContext)
+                .forEachRemaining(written::add);
+        assertEquals(2, written.size());
+        assertEquals(0, written.get(0).bucketId());
+        assertEquals(1, written.get(1).bucketId());
     }
 
     @Test
