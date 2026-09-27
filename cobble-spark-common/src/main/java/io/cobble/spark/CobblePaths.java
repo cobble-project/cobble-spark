@@ -121,7 +121,7 @@ public final class CobblePaths {
         coordinatorConfig.logPath = new File(localDir, "cobble-coordinator.log").getAbsolutePath();
 
         Config.VolumeDescriptor volume = new Config.VolumeDescriptor();
-        volume.baseDir = scanVolume(config);
+        volume.baseDir = config.pathUri();
         volume.kinds = Arrays.asList(Config.VolumeUsageKind.META, Config.VolumeUsageKind.SNAPSHOT);
         coordinatorConfig.addVolume(volume);
         return coordinatorConfig;
@@ -148,7 +148,7 @@ public final class CobblePaths {
         scanConfig.logConsole = false;
 
         Config.VolumeDescriptor volume = new Config.VolumeDescriptor();
-        volume.baseDir = scanVolume(config);
+        volume.baseDir = config.pathUri();
         volume.kinds =
                 Arrays.asList(
                         Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH,
@@ -164,14 +164,6 @@ public final class CobblePaths {
                     optionKey + " must be in [0, " + Integer.MAX_VALUE + "].");
         }
         return (int) value;
-    }
-
-    private static String scanVolume(CobbleOptions.CobbleTableConfig config) {
-        if (!config.isCatalogTable()) return config.pathUri();
-        CobbleCatalogReference reference = config.catalogReference();
-        String root = reference.warehouse();
-        if (!root.endsWith("/")) root += "/";
-        return root + reference.storageId() + "/tables/TABLE-" + reference.tableId();
     }
 
     private static void mkdirs(File dir) {

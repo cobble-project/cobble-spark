@@ -94,7 +94,7 @@ public final class CobbleTableRuntime {
                         readConfig,
                         new TablePathRequest(
                                 config.pathUri(),
-                                selectedTableName(config),
+                                config.tableName(),
                                 config.hasSnapshotId() ? Long.valueOf(config.snapshotId()) : null,
                                 config.resolverOptions()))) {
             return reader.scanPlan();
@@ -113,11 +113,23 @@ public final class CobbleTableRuntime {
                     "Cobble table " + config.pathUri() + " has no committed snapshot.");
         }
         CobbleLoader.ensureCobbleLoaded();
-        if (config.isCatalogTable()) validateCatalog(config, snapshot);
         Config readConfig = runtimeConfig(config, snapshot.totalBuckets);
         try {
+            if (config.isCatalogTable()) {
+                CobbleCatalogReference reference = config.catalogReference();
+                try (FileCatalog catalog =
+                                FileCatalog.open(catalogConfig(reference), reference.storageId());
+                        CatalogTable table = catalog.loadTable(reference.identifier())) {
+                    if (config.hasSnapshotId()) reference.validateTable(table);
+                    else reference.validate(table);
+                    try (TableReader reader =
+                            table.readerBuilder(readConfig).globalSnapshot(snapshot.id).open()) {
+                        return reader.scanPlan();
+                    }
+                }
+            }
             try (TableReader reader =
-                    TableReader.open(readConfig, selectedTableName(config), snapshot.id)) {
+                    TableReader.open(readConfig, config.tableName(), snapshot.id)) {
                 return reader.scanPlan();
             }
         } catch (RuntimeException error) {
@@ -130,25 +142,8 @@ public final class CobbleTableRuntime {
         return snapshot == null || "cobble-table".equals(loadReadPlan(config, snapshot).formatId());
     }
 
-    private static void validateCatalog(
-            CobbleOptions.CobbleTableConfig config, GlobalSnapshot snapshot) {
-        CobbleCatalogReference reference = config.catalogReference();
-        try (FileCatalog catalog =
-                        FileCatalog.open(catalogConfig(reference), reference.storageId());
-                CatalogTable table = catalog.loadTable(reference.identifier())) {
-            if (config.hasSnapshotId()) reference.validateTable(table);
-            else reference.validate(table);
-        }
-    }
-
     private static Config catalogConfig(CobbleCatalogReference reference) {
         return new Config().addVolume(reference.warehouse());
-    }
-
-    private static String selectedTableName(CobbleOptions.CobbleTableConfig config) {
-        return config.isCatalogTable()
-                ? "t" + config.catalogReference().tableId()
-                : config.tableName();
     }
 
     private static Config runtimeConfig(

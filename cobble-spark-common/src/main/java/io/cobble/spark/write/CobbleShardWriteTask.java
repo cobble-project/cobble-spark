@@ -47,7 +47,6 @@ public final class CobbleShardWriteTask {
         int perBucketBuffer = CobblePaths.perBucketWriteBuffer(context.config(), count);
         Map<Integer, ShardSnapshot> base =
                 baseByBucket(context.baseSnapshot(), context.totalBuckets());
-        verifyBaseStillCurrent(context);
         CobbleSparkRowConverter converter = new CobbleSparkRowConverter(context.schema());
         DirectWriteBuffers buffers = new DirectWriteBuffers();
         if (context.config().isCatalogTable()) {
@@ -80,22 +79,6 @@ public final class CobbleShardWriteTask {
                 buffers);
     }
 
-    /** Reject a task launched after another writer has already published a different base. */
-    private static void verifyBaseStillCurrent(CobbleWriteContext context) throws IOException {
-        GlobalSnapshot current;
-        try (io.cobble.DbCoordinator coordinator =
-                io.cobble.DbCoordinator.open(
-                        CobblePaths.createCoordinatorConfig(
-                                context.config(), Integer.valueOf(context.totalBuckets())))) {
-            current = coordinator.loadCurrentGlobalSnapshot();
-        }
-        GlobalSnapshot expected = context.baseSnapshot();
-        if ((expected == null && current != null)
-                || (expected != null && (current == null || current.id != expected.id))) {
-            throw new IOException("Cobble write task observed a stale committed base snapshot.");
-        }
-    }
-
     /** Runs the shared row routing/snapshot lifecycle after a mode-specific bucket opener. */
     private static Iterator<CobbleShardResult> writeOpenedBuckets(
             Iterator<Tuple2<Integer, Row>> rows,
@@ -113,9 +96,6 @@ public final class CobbleShardWriteTask {
             for (int bucket = start; bucket <= end; bucket++) {
                 writers[bucket - start] = opener.open(bucket);
             }
-            // A task may have waited for another attempt's native bucket lock; reject a base
-            // superseded during that wait before it can write any rows.
-            verifyBaseStillCurrent(context);
             while (rows.hasNext()) {
                 Tuple2<Integer, Row> pair = rows.next();
                 int bucket = pair._1().intValue();
