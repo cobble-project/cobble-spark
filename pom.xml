@@ -47,7 +47,7 @@
         <spark.version>3.3.4</spark.version>
         <scala.binary.version>2.12</scala.binary.version>
         <scala.version>2.12.18</scala.version>
-        <cobble.java.version>0.5.0-SNAPSHOT</cobble.java.version>
+        <cobble.java.version>0.6.0-SNAPSHOT</cobble.java.version>
         <revision>0.5.0-1-SNAPSHOT</revision>
         <junit.version>5.10.2</junit.version>
         <surefire.test.jvm.args></surefire.test.jvm.args>
