@@ -5,6 +5,7 @@ import io.cobble.Config;
 import java.io.Serializable;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -30,6 +31,9 @@ public final class CobbleOptions {
     public static final String SNAPSHOT_ID = "snapshot-id";
 
     public static final String LATEST_SNAPSHOT = "latest";
+
+    /** Selected snapshot column family. Native tables use {@code data} by default. */
+    public static final String TABLE_NAME = "table-name";
 
     /**
      * Unsupported snapshot cleanup option. Restored bucket databases can share files with older
@@ -69,6 +73,8 @@ public final class CobbleOptions {
         private final Config.DataFileType dataFileType;
         private final long readBlockCacheBytes;
         private final CobbleCatalogReference catalogReference;
+        private final String tableName;
+        private final Map<String, String> resolverOptions;
 
         private CobbleTableConfig(
                 String pathUri,
@@ -78,7 +84,9 @@ public final class CobbleOptions {
                 long writeBufferMemoryBytes,
                 Config.DataFileType dataFileType,
                 long readBlockCacheBytes,
-                CobbleCatalogReference catalogReference) {
+                CobbleCatalogReference catalogReference,
+                String tableName,
+                Map<String, String> resolverOptions) {
             this.pathUri = pathUri;
             this.bucketCount = bucketCount;
             this.snapshotId = snapshotId;
@@ -87,10 +95,26 @@ public final class CobbleOptions {
             this.dataFileType = dataFileType;
             this.readBlockCacheBytes = readBlockCacheBytes;
             this.catalogReference = catalogReference;
+            this.tableName = tableName;
+            this.resolverOptions =
+                    Collections.unmodifiableMap(
+                            new TreeMap<String, String>(
+                                    resolverOptions == null
+                                            ? Collections.<String, String>emptyMap()
+                                            : resolverOptions));
         }
 
         public String pathUri() {
             return pathUri;
+        }
+
+        public String tableName() {
+            return tableName;
+        }
+
+        /** Opaque plugin options forwarded unchanged to generic table path resolution. */
+        public Map<String, String> resolverOptions() {
+            return resolverOptions;
         }
 
         public boolean hasBucketCount() {
@@ -152,7 +176,9 @@ public final class CobbleOptions {
                     writeBufferMemoryBytes,
                     dataFileType,
                     readBlockCacheBytes,
-                    Objects.requireNonNull(reference, "reference"));
+                    Objects.requireNonNull(reference, "reference"),
+                    tableName,
+                    resolverOptions);
         }
 
         @Override
@@ -277,7 +303,9 @@ public final class CobbleOptions {
                 writeBuffer,
                 dataFileType,
                 readCache,
-                null);
+                null,
+                parseTableName(normalized.get(TABLE_NAME)),
+                normalized);
     }
 
     /**
@@ -310,6 +338,13 @@ public final class CobbleOptions {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException(key + " must be an integer, but was: " + value, e);
         }
+    }
+
+    private static String parseTableName(String rawTableName) {
+        if (rawTableName == null || rawTableName.trim().isEmpty()) {
+            return CobbleTableRuntime.TABLE_NAME;
+        }
+        return rawTableName.trim();
     }
 
     private static long parseLongOption(String key, String value) {

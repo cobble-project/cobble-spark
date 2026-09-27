@@ -459,9 +459,9 @@ public class CobbleSparkReadWriteTest {
                 CobbleOptions.parse(
                         Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
         GlobalSnapshot firstSnapshot = loadCurrentSnapshot(config);
-        TableScanPlan plan = CobbleTableRuntime.loadScanPlan(config, firstSnapshot);
+        io.cobble.table.TableScanPlan plan = CobbleTableRuntime.loadReadPlan(config, firstSnapshot);
         CobbleTableSchema scanSchema =
-                CobbleTableSchema.fromTableSchema(plan.schema(), plan.totalBuckets());
+                CobbleTableSchema.fromReadSchema(plan.readSchema(), firstSnapshot.totalBuckets);
 
         writeAndRead(
                 Arrays.asList(
@@ -469,7 +469,7 @@ public class CobbleSparkReadWriteTest {
                         row(2, "new", "3.00", null, null, 0d)),
                 2,
                 1);
-        assertTrue(loadCurrentSnapshot(config).id > plan.snapshotId());
+        assertTrue(loadCurrentSnapshot(config).id > firstSnapshot.id);
 
         CobbleBatch batch =
                 new CobbleBatch(config, scanSchema, scanSchema, scanSchema.toStructType(), plan);
@@ -485,7 +485,6 @@ public class CobbleSparkReadWriteTest {
                 }
             }
         }
-        assertEquals(firstSnapshot.id, plan.snapshotId());
         assertEquals(Collections.singletonList(Integer.valueOf(1)), ids);
         assertEquals(Collections.singletonList("before"), names);
     }
@@ -614,7 +613,7 @@ public class CobbleSparkReadWriteTest {
                 CobbleOptions.parse(
                         Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
         GlobalSnapshot snapshot = loadCurrentSnapshot(config);
-        TableScanPlan plan = CobbleTableRuntime.loadScanPlan(config, snapshot);
+        TableScanPlan plan = CobbleTableRuntime.loadReadPlan(config, snapshot);
         List<Value> matched = null;
         for (io.cobble.table.TableScanSplit split : plan.splits()) {
             try (TableScanCursor cursor =

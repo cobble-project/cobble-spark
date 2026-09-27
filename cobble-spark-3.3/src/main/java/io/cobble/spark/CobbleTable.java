@@ -1,6 +1,7 @@
 package io.cobble.spark;
 
 import io.cobble.spark.write.CobbleWriteBuilder;
+import io.cobble.table.TablePathMissingSnapshotException;
 import io.cobble.table.TableScanPlan;
 
 import org.apache.spark.sql.connector.catalog.SupportsRead;
@@ -13,7 +14,6 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.util.EnumSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -49,6 +49,19 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
 
     @Override
     public StructType schema() {
+        if (!config.isCatalogTable()) {
+            try {
+                TableScanPlan plan = CobbleTableRuntime.resolveReadPlan(config);
+                return CobbleTableSchema.fromReadSchema(plan.readSchema(), plan.totalBuckets())
+                        .toStructType();
+            } catch (TablePathMissingSnapshotException error) {
+                // Spark asks for a schema before initializing a new path-based table. Preserve the
+                // caller-provided schema only for that no-snapshot creation path; recognized
+                // formats and fixed snapshot reads still expose their resolver failures.
+                if (providedSchema != null && !config.hasSnapshotId()) return providedSchema;
+                throw error;
+            }
+        }
         io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(config);
         if (config.isCatalogTable() && !config.hasSnapshotId()) {
             // The catalog descriptor is the latest requested schema. A snapshot deliberately
@@ -89,42 +102,37 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
     @Override
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
         CobbleOptions.CobbleTableConfig scanConfig = operationConfig(options.asCaseSensitiveMap());
-        io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(scanConfig);
         CobbleTableSchema sourceSchema;
         CobbleTableSchema targetSchema;
         TableScanPlan scanPlan = null;
-        if (snapshot != null) {
-            scanPlan = CobbleTableRuntime.loadScanPlan(scanConfig, snapshot);
+        if (!scanConfig.isCatalogTable()) {
+            scanPlan = CobbleTableRuntime.resolveReadPlan(scanConfig);
             sourceSchema =
-                    CobbleTableSchema.fromTableSchema(scanPlan.schema(), scanPlan.totalBuckets());
-            targetSchema =
-                    scanConfig.isCatalogTable() && !scanConfig.hasSnapshotId()
-                            ? CobbleTableSchema.fromTableSchema(
-                                    scanConfig.catalogReference().schema(), scanPlan.totalBuckets())
-                            : sourceSchema;
-        } else if (scanConfig.isCatalogTable()) {
-            sourceSchema =
-                    CobbleTableSchema.fromTableSchema(
-                            scanConfig.catalogReference().schema(),
-                            scanConfig.hasBucketCount()
-                                    ? scanConfig.bucketCount()
-                                    : CobbleOptions.DEFAULT_BUCKET);
-            targetSchema = sourceSchema;
-        } else if (providedSchema != null && !scanConfig.hasSnapshotId()) {
-            List<String> primaryKeys =
-                    CobbleTableSchema.parsePrimaryKeyOption(
-                            operationOptions(options.asCaseSensitiveMap())
-                                    .get(CobbleOptions.PRIMARY_KEY));
-            int totalBuckets =
-                    scanConfig.hasBucketCount()
-                            ? scanConfig.bucketCount()
-                            : CobbleOptions.DEFAULT_BUCKET;
-            sourceSchema =
-                    CobbleTableSchema.fromStructType(providedSchema, primaryKeys, totalBuckets);
+                    CobbleTableSchema.fromReadSchema(
+                            scanPlan.readSchema(), scanPlan.totalBuckets());
             targetSchema = sourceSchema;
         } else {
-            throw new IllegalArgumentException(
-                    "Cobble table " + scanConfig.pathUri() + " has no committed snapshot.");
+            io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(scanConfig);
+            if (snapshot != null) {
+                scanPlan = CobbleTableRuntime.loadReadPlan(scanConfig, snapshot);
+                sourceSchema =
+                        CobbleTableSchema.fromReadSchema(
+                                scanPlan.readSchema(), snapshot.totalBuckets);
+                targetSchema =
+                        !scanConfig.hasSnapshotId()
+                                ? CobbleTableSchema.fromTableSchema(
+                                        scanConfig.catalogReference().schema(),
+                                        snapshot.totalBuckets)
+                                : sourceSchema;
+            } else {
+                sourceSchema =
+                        CobbleTableSchema.fromTableSchema(
+                                scanConfig.catalogReference().schema(),
+                                scanConfig.hasBucketCount()
+                                        ? scanConfig.bucketCount()
+                                        : CobbleOptions.DEFAULT_BUCKET);
+                targetSchema = sourceSchema;
+            }
         }
         return new CobbleScanBuilder(scanConfig, sourceSchema, targetSchema, scanPlan);
     }
@@ -136,6 +144,16 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
         if (writeConfig.hasSnapshotId()) {
             throw new UnsupportedOperationException(
                     "Writing a snapshot-id Cobble table is not supported.");
+        }
+        if (!writeConfig.isCatalogTable()
+                && !CobbleTableRuntime.TABLE_NAME.equals(writeConfig.tableName())) {
+            throw new UnsupportedOperationException(
+                    "table-name selects a read-only snapshot column family; path writes target data only.");
+        }
+        io.cobble.GlobalSnapshot existing = CobbleTableRuntime.loadSnapshot(writeConfig);
+        if (!CobbleTableRuntime.isNativeFormat(writeConfig, existing)) {
+            throw new UnsupportedOperationException(
+                    "Cobble state snapshot formats are read-only in Spark.");
         }
         if (writeConfig.isCatalogTable()) {
             // Fail before Spark launches tasks if a captured table was renamed, dropped, or

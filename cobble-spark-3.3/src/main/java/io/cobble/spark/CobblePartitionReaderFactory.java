@@ -35,6 +35,6 @@ public final class CobblePartitionReaderFactory implements PartitionReaderFactor
         }
         CobbleInputPartition cobblePartition = (CobbleInputPartition) partition;
         return new CobblePartitionReader(
-                cobblePartition.split(), config, sourceSchema, targetSchema, requiredSchema);
+                cobblePartition.plan(), config, sourceSchema, targetSchema, requiredSchema);
     }
 }

@@ -2,6 +2,7 @@ package io.cobble.spark;
 
 import io.cobble.table.DataField;
 import io.cobble.table.LogicalType;
+import io.cobble.table.TableReadSchema;
 import io.cobble.table.TableSchema;
 
 import org.apache.spark.sql.types.StructField;
@@ -22,6 +23,7 @@ public final class CobbleTableSchema implements Serializable {
 
     private final TableSchema tableSchema;
     private final StructType sparkSchema;
+    private final List<DataField> fields;
     private final List<String> primaryKeys;
     private final int totalBuckets;
     private transient volatile Map<Long, Integer> positionsById;
@@ -33,6 +35,12 @@ public final class CobbleTableSchema implements Serializable {
             int totalBuckets) {
         this.tableSchema = tableSchema;
         this.sparkSchema = sparkSchema;
+        this.fields =
+                Collections.unmodifiableList(
+                        new ArrayList<DataField>(
+                                tableSchema == null
+                                        ? Collections.<DataField>emptyList()
+                                        : tableSchema.fields()));
         this.primaryKeys = Collections.unmodifiableList(new ArrayList<String>(primaryKeys));
         this.totalBuckets = totalBuckets;
     }
@@ -109,7 +117,35 @@ public final class CobbleTableSchema implements Serializable {
                 totalBuckets);
     }
 
+    /** Builds a read-only Spark schema from a generic table-read schema, without requiring keys. */
+    public static CobbleTableSchema fromReadSchema(TableReadSchema schema, int totalBuckets) {
+        List<StructField> sparkFields = new ArrayList<StructField>(schema.fields().size());
+        for (DataField field : schema.fields())
+            sparkFields.add(CobbleSparkTypes.toSparkField(field));
+        return new CobbleTableSchema(
+                null,
+                new StructType(sparkFields.toArray(new StructField[0])),
+                Collections.<String>emptyList(),
+                totalBuckets,
+                schema.fields());
+    }
+
+    private CobbleTableSchema(
+            TableSchema tableSchema,
+            StructType sparkSchema,
+            List<String> primaryKeys,
+            int totalBuckets,
+            List<DataField> fields) {
+        this.tableSchema = tableSchema;
+        this.sparkSchema = sparkSchema;
+        this.fields = Collections.unmodifiableList(new ArrayList<DataField>(fields));
+        this.primaryKeys = Collections.unmodifiableList(new ArrayList<String>(primaryKeys));
+        this.totalBuckets = totalBuckets;
+    }
+
     public TableSchema toTableSchema() {
+        if (tableSchema == null)
+            throw new UnsupportedOperationException("read-only format has no write schema");
         return tableSchema;
     }
 
@@ -135,7 +171,7 @@ public final class CobbleTableSchema implements Serializable {
 
     /** Returns the stable native field id for a Spark-schema ordinal. */
     public long fieldId(int ordinal) {
-        return toTableSchema().fields().get(ordinal).id();
+        return fields.get(ordinal).id();
     }
 
     /** Returns the active schema ordinal for a stable native field id, or {@code -1} if retired. */
@@ -194,7 +230,7 @@ public final class CobbleTableSchema implements Serializable {
     }
 
     public LogicalType logicalType(int ordinal) {
-        return toTableSchema().fields().get(ordinal).logicalType();
+        return fields.get(ordinal).logicalType();
     }
 
     public void validateWriteSchema(StructType provided) {
@@ -257,7 +293,7 @@ public final class CobbleTableSchema implements Serializable {
         Map<Long, Integer> cached = positionsById;
         if (cached == null) {
             cached = new LinkedHashMap<Long, Integer>();
-            List<DataField> fields = toTableSchema().fields();
+            List<DataField> fields = this.fields;
             for (int i = 0; i < fields.size(); i++) cached.put(fields.get(i).id(), i);
             positionsById = cached;
         }

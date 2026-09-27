@@ -38,6 +38,15 @@ public final class CobbleDataSource
     @Override
     public StructType inferSchema(CaseInsensitiveStringMap options) {
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(options.asCaseSensitiveMap());
+        if (!config.isCatalogTable()) {
+            try {
+                io.cobble.table.TableScanPlan plan = CobbleTableRuntime.resolveReadPlan(config);
+                return CobbleTableSchema.fromReadSchema(plan.readSchema(), plan.totalBuckets())
+                        .toStructType();
+            } catch (IllegalArgumentException noReadablePlan) {
+                return null;
+            }
+        }
         io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(config);
         return snapshot == null
                 ? null
@@ -70,8 +79,18 @@ public final class CobbleDataSource
         Map<String, String> options =
                 new HashMap<>(scala.collection.JavaConverters.mapAsJavaMap(parameters));
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(options);
+        if (!CobbleTableRuntime.TABLE_NAME.equals(config.tableName())) {
+            throw new UnsupportedOperationException(
+                    "table-name selects a read-only snapshot column family; path writes target data only.");
+        }
 
         boolean exists = CobbleTableRuntime.tableExists(config);
+        if (exists
+                && !CobbleTableRuntime.isNativeFormat(
+                        config, CobbleTableRuntime.loadSnapshot(config))) {
+            throw new UnsupportedOperationException(
+                    "Cobble state snapshot formats are read-only in Spark.");
+        }
         if (mode.equals(SaveMode.ErrorIfExists) && exists) {
             throw new IllegalArgumentException(
                     "Cobble table "

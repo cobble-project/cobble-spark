@@ -43,7 +43,11 @@ public final class CobbleBatch implements Batch {
         for (TableScanSplit split : splits) {
             partitions.add(
                     new CobbleInputPartition(
-                            split, config, sourceSchema, targetSchema, requiredSchema));
+                            scanPlan.forSplit(split),
+                            config,
+                            sourceSchema,
+                            targetSchema,
+                            requiredSchema));
         }
         return partitions.toArray(new InputPartition[0]);
     }

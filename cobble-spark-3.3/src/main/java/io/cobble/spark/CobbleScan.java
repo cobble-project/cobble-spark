@@ -44,7 +44,7 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     @Override
     public Statistics estimateStatistics() {
-        long sizeBytes = scanPlan == null ? 0L : scanPlan.dataSizeBytes();
+        long sizeBytes = 0L;
         final long sizeInBytes = Math.max(sizeBytes, 0L);
         return new Statistics() {
             @Override
@@ -61,6 +61,6 @@ public final class CobbleScan implements Scan, SupportsReportStatistics {
 
     @Override
     public String description() {
-        return "Cobble scan snapshot=" + (scanPlan == null ? 0L : scanPlan.snapshotId());
+        return "Cobble fixed snapshot scan";
     }
 }

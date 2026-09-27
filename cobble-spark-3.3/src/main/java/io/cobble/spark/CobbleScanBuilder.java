@@ -48,7 +48,26 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
 
     @Override
     public Scan build() {
-        return new CobbleScan(config, sourceSchema, targetSchema, requiredSchema, scanPlan);
+        if (scanPlan == null) {
+            return new CobbleScan(config, sourceSchema, targetSchema, requiredSchema, null);
+        }
+        java.util.List<String> fields = new java.util.ArrayList<String>();
+        for (org.apache.spark.sql.types.StructField field : requiredSchema.fields()) {
+            int sourceOrdinal =
+                    sourceSchema.ordinalForFieldId(
+                            targetSchema.fieldId(targetSchema.ordinalOf(field.name())));
+            if (sourceOrdinal >= 0) {
+                fields.add(sourceSchema.toStructType().fields()[sourceOrdinal].name());
+            }
+        }
+        TableScanPlan projected = scanPlan.project(fields);
+        return new CobbleScan(
+                config,
+                CobbleTableSchema.fromReadSchema(
+                        projected.readSchema(), sourceSchema.totalBuckets()),
+                targetSchema,
+                requiredSchema,
+                projected);
     }
 
     private String name() {
