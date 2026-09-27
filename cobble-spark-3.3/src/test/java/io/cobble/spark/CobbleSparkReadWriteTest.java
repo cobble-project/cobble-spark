@@ -453,6 +453,45 @@ public class CobbleSparkReadWriteTest {
     }
 
     @Test
+    public void scanStatisticsUseFixedSnapshotSize() {
+        writeAndRead(Collections.singletonList(row(1, "value", "1.00", null, null, 0d)), 2, 1);
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(
+                        Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
+        TableScanPlan plan = CobbleTableRuntime.resolveReadPlan(config);
+        CobbleTableSchema source =
+                CobbleTableSchema.fromReadSchema(plan.readSchema(), plan.totalBuckets());
+        assertTrue(plan.dataSizeBytes() > 0);
+        for (TableScanPlan projected :
+                Arrays.asList(
+                        plan,
+                        plan.project(Collections.singletonList("id")),
+                        plan.project(Collections.<String>emptyList()))) {
+            CobbleScan scan =
+                    new CobbleScan(config, source, source, source.toStructType(), projected);
+            assertEquals(plan.dataSizeBytes(), scan.estimateStatistics().sizeInBytes().getAsLong());
+            assertFalse(scan.estimateStatistics().numRows().isPresent());
+        }
+        Dataset<Row> read = spark.read().format("cobble").load(tableDir.toUri().toString());
+        assertEquals(
+                plan.dataSizeBytes(),
+                read.queryExecution().optimizedPlan().stats().sizeInBytes().longValue());
+    }
+
+    @Test
+    public void scanStatisticsReportZeroForTableWithoutSnapshot() {
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(
+                        Collections.singletonMap(CobbleOptions.PATH, tableDir.toUri().toString()));
+        CobbleTableSchema source =
+                CobbleTableSchema.fromStructType(schema, Collections.singletonList("id"), 2);
+        CobbleScan scan = new CobbleScan(config, source, source, schema, null);
+        assertEquals(0L, scan.estimateStatistics().sizeInBytes().getAsLong());
+        assertFalse(scan.estimateStatistics().numRows().isPresent());
+        assertEquals(0, scan.toBatch().planInputPartitions().length);
+    }
+
+    @Test
     public void tableScanPlanRemainsPinnedWhenDataIsAppended() throws Exception {
         writeAndRead(Collections.singletonList(row(1, "before", "1.00", null, null, 0d)), 2, 1);
         CobbleOptions.CobbleTableConfig config =
