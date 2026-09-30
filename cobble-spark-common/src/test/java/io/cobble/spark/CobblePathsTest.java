@@ -20,6 +20,63 @@ class CobblePathsTest {
     @TempDir Path tableRoot;
 
     @Test
+    void remoteStorageOptionsReachEveryRuntimeVolumeAndSecretsNeverAppearInConfigDescription() {
+        Map<String, String> values = new HashMap<>();
+        values.put("path", "s3://bucket/table");
+        values.put("storage.option.endpoint", "http://localhost:9000");
+        values.put("storage.option.access_key_id", "key");
+        values.put("storage.option.secret_access_key", "private-secret");
+        values.put("storage.option.enable_virtual_host_style", "false");
+        values.put("storage.option.CustomProviderKey", "value");
+        CobbleOptions.CobbleTableConfig options = CobbleOptions.parse(values);
+        for (Config config :
+                new Config[] {
+                    CobblePaths.createCatalogConfig(options),
+                    CobblePaths.createPathWriterRuntimeConfig(options, 1, 100),
+                    CobblePaths.createCoordinatorConfig(options, 1),
+                    CobblePaths.createScanConfig(options, 1, 1)
+                }) {
+            for (Config.VolumeDescriptor volume : config.volumes) {
+                assertEquals("key", volume.accessId);
+                assertEquals("private-secret", volume.secretKey);
+                assertEquals("http://localhost:9000", volume.customOptions.get("endpoint"));
+                assertEquals("false", volume.customOptions.get("enable_virtual_host_style"));
+                assertEquals("value", volume.customOptions.get("CustomProviderKey"));
+                assertFalse(volume.customOptions.containsKey("region"));
+            }
+            assertEquals(null, config.logPath);
+        }
+        assertFalse(options.toString().contains("private-secret"));
+    }
+
+    @Test
+    void unknownSensitiveProviderOptionsAreRejectedAndKnownCredentialNamesCanonicalized() {
+        for (String key :
+                new String[] {
+                    "FS.S3A.SECRET.KEY", "password", "credentials", "api_key", "access.key"
+                }) {
+            Map<String, String> values = new HashMap<>();
+            values.put("path", "s3://bucket/table");
+            values.put("storage.option." + key, "private");
+            assertThrows(IllegalArgumentException.class, () -> CobbleOptions.parse(values));
+        }
+        Map<String, String> values = new HashMap<>();
+        values.put("path", "s3://bucket/table");
+        values.put("storage.option.SECRET_ACCESS_KEY", "private");
+        assertEquals(
+                "private",
+                CobblePaths.createScanConfig(CobbleOptions.parse(values), 1, 1)
+                        .volumes
+                        .get(0)
+                        .customOptions
+                        .get("secret_access_key"));
+        assertEquals("mock:///tmp/table", CobbleOptions.normalizePathUri("mock:/tmp/table"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> CobbleOptions.normalizePathUri("s3://user:private@bucket/table"));
+    }
+
+    @Test
     void pathWriterRuntimeLeavesBucketScopingToTheTableBuilder() {
         CobbleOptions.CobbleTableConfig options = options(80L, null);
 
@@ -33,7 +90,7 @@ class CobblePathsTest {
         assertEquals(Integer.valueOf(10), config.memtableCapacity);
         assertEquals(Integer.valueOf(1), config.memtableBufferCount);
         assertEquals(2, config.volumes.size());
-        String root = CobblePaths.tableRoot(options).getAbsolutePath();
+        String root = options.pathUri();
         assertEquals(root, config.volumes.get(0).baseDir);
         assertEquals(root, config.volumes.get(1).baseDir);
         assertTrue(CobblePaths.tableRoot(options).isDirectory());

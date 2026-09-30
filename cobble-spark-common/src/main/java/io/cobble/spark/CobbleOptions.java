@@ -75,6 +75,8 @@ public final class CobbleOptions {
         private final CobbleCatalogReference catalogReference;
         private final String tableName;
         private final Map<String, String> resolverOptions;
+        private final CobbleStorageOptions storageOptions;
+        private final CobbleHadoopContext hadoopContext;
 
         private CobbleTableConfig(
                 String pathUri,
@@ -86,7 +88,8 @@ public final class CobbleOptions {
                 long readBlockCacheBytes,
                 CobbleCatalogReference catalogReference,
                 String tableName,
-                Map<String, String> resolverOptions) {
+                Map<String, String> resolverOptions,
+                CobbleHadoopContext hadoopContext) {
             this.pathUri = pathUri;
             this.bucketCount = bucketCount;
             this.snapshotId = snapshotId;
@@ -102,6 +105,8 @@ public final class CobbleOptions {
                                     resolverOptions == null
                                             ? Collections.<String, String>emptyMap()
                                             : resolverOptions));
+            this.storageOptions = CobbleStorageOptions.parse(this.resolverOptions);
+            this.hadoopContext = Objects.requireNonNull(hadoopContext, "hadoopContext");
         }
 
         public String pathUri() {
@@ -115,6 +120,29 @@ public final class CobbleOptions {
         /** Opaque plugin options forwarded unchanged to generic table path resolution. */
         public Map<String, String> resolverOptions() {
             return resolverOptions;
+        }
+
+        CobbleStorageOptions storageOptions() {
+            return storageOptions;
+        }
+
+        CobbleHadoopContext hadoopContext() {
+            return hadoopContext;
+        }
+
+        CobbleTableConfig withHadoopContext(CobbleHadoopContext context) {
+            return new CobbleTableConfig(
+                    pathUri,
+                    bucketCount,
+                    snapshotId,
+                    writeTasks,
+                    writeBufferMemoryBytes,
+                    dataFileType,
+                    readBlockCacheBytes,
+                    catalogReference,
+                    tableName,
+                    resolverOptions,
+                    context);
         }
 
         public boolean hasBucketCount() {
@@ -178,7 +206,8 @@ public final class CobbleOptions {
                     readBlockCacheBytes,
                     Objects.requireNonNull(reference, "reference"),
                     tableName,
-                    resolverOptions);
+                    resolverOptions,
+                    hadoopContext);
         }
 
         @Override
@@ -305,31 +334,33 @@ public final class CobbleOptions {
                 readCache,
                 null,
                 parseTableName(normalized.get(TABLE_NAME)),
-                normalized);
+                normalized,
+                CobbleHadoopContext.capture());
     }
 
-    /**
-     * Normalizes a user supplied path to an absolute URI string. Only local filesystem paths are
-     * supported by this connector version.
-     */
+    /** Normalizes a user supplied path to an absolute local or hierarchical storage URI. */
     public static String normalizePathUri(String path) {
         URI uri;
         try {
             uri = new URI(path);
         } catch (URISyntaxException e) {
-            throw new IllegalArgumentException("Invalid Cobble table path: " + path, e);
+            throw new IllegalArgumentException("Invalid Cobble table path URI.");
         }
         String scheme = uri.getScheme();
         if (scheme == null) {
             return java.nio.file.Paths.get(path).toUri().toString();
         }
-        if (!"file".equalsIgnoreCase(scheme)) {
+        if (uri.isOpaque()
+                || uri.getQuery() != null
+                || uri.getFragment() != null
+                || uri.getUserInfo() != null) {
             throw new IllegalArgumentException(
-                    "The Cobble Spark connector currently only supports local 'file' paths, but"
-                            + " got: "
-                            + path);
+                    "Cobble paths require a hierarchical URI without credentials, query or fragment.");
         }
-        return uri.toString();
+        uri = uri.normalize();
+        if ("file".equalsIgnoreCase(scheme)) return java.nio.file.Paths.get(uri).toUri().toString();
+        // Core distinguishes storage URIs from local paths by the :// delimiter.
+        return uri.getRawAuthority() == null ? scheme + "://" + uri.getRawPath() : uri.toString();
     }
 
     private static int parseIntOption(String key, String value) {

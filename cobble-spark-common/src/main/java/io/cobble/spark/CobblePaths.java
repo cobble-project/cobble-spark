@@ -12,12 +12,34 @@ import java.util.Collections;
 /**
  * Builds the Cobble {@link Config}s used by writers, the coordinator, and scan readers.
  *
- * <p>All configs target local tables. Table writers scope their own physical bucket directories;
- * table-root metadata is reserved for global coordination.
+ * <p>Table writers scope their own physical bucket directories; table-root metadata is reserved for
+ * global coordination.
  */
 public final class CobblePaths {
 
     private CobblePaths() {}
+
+    public static boolean isLocal(String pathUri) {
+        String scheme = URI.create(pathUri).getScheme();
+        return scheme == null || "file".equalsIgnoreCase(scheme);
+    }
+
+    public static Config.VolumeDescriptor volume(
+            CobbleOptions.CobbleTableConfig config, String uri) {
+        Config.VolumeDescriptor volume = Config.VolumeDescriptor.singleVolume(uri);
+        config.storageOptions().applyTo(volume);
+        return volume;
+    }
+
+    public static Config createCatalogConfig(CobbleOptions.CobbleTableConfig config) {
+        return new Config()
+                .addVolume(
+                        volume(
+                                config,
+                                config.isCatalogTable()
+                                        ? config.catalogReference().warehouse()
+                                        : config.pathUri()));
+    }
 
     /** Local directory of the table root. */
     public static File tableRoot(CobbleOptions.CobbleTableConfig config) {
@@ -37,21 +59,16 @@ public final class CobblePaths {
         if (memtableCapacity <= 0) {
             throw new IllegalArgumentException("memtableCapacity must be positive");
         }
-        File localDir = tableRoot(config);
-        mkdirs(localDir);
-
         Config dbConfig = createWriterRuntimeConfig(totalBuckets, memtableCapacity);
         dbConfig.dataFileType = config.dataFileType();
-        dbConfig.logPath = new File(localDir, "cobble-writer.log").getAbsolutePath();
+        localLog(config, dbConfig, "cobble-writer.log");
 
-        Config.VolumeDescriptor localVolume = new Config.VolumeDescriptor();
-        localVolume.baseDir = localDir.getAbsolutePath();
+        Config.VolumeDescriptor localVolume = volume(config, config.pathUri());
         localVolume.kinds =
                 Collections.singletonList(Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);
         dbConfig.addVolume(localVolume);
 
-        Config.VolumeDescriptor tableVolume = new Config.VolumeDescriptor();
-        tableVolume.baseDir = localDir.getAbsolutePath();
+        Config.VolumeDescriptor tableVolume = volume(config, config.pathUri());
         tableVolume.kinds =
                 Arrays.asList(Config.VolumeUsageKind.META, Config.VolumeUsageKind.SNAPSHOT);
         dbConfig.addVolume(tableVolume);
@@ -109,19 +126,15 @@ public final class CobblePaths {
      */
     public static Config createCoordinatorConfig(
             CobbleOptions.CobbleTableConfig config, Integer totalBucketsOrNull) {
-        File localDir = tableRoot(config);
-        mkdirs(localDir);
-
         Config coordinatorConfig = new Config();
         if (totalBucketsOrNull != null) {
             coordinatorConfig.totalBuckets(totalBucketsOrNull.intValue());
         }
         coordinatorConfig.governanceMode = Config.GovernanceMode.NOOP;
         coordinatorConfig.logConsole = false;
-        coordinatorConfig.logPath = new File(localDir, "cobble-coordinator.log").getAbsolutePath();
+        localLog(config, coordinatorConfig, "cobble-coordinator.log");
 
-        Config.VolumeDescriptor volume = new Config.VolumeDescriptor();
-        volume.baseDir = config.pathUri();
+        Config.VolumeDescriptor volume = volume(config, config.pathUri());
         volume.kinds = Arrays.asList(Config.VolumeUsageKind.META, Config.VolumeUsageKind.SNAPSHOT);
         coordinatorConfig.addVolume(volume);
         return coordinatorConfig;
@@ -147,8 +160,7 @@ public final class CobblePaths {
         scanConfig.governanceMode = Config.GovernanceMode.NOOP;
         scanConfig.logConsole = false;
 
-        Config.VolumeDescriptor volume = new Config.VolumeDescriptor();
-        volume.baseDir = config.pathUri();
+        Config.VolumeDescriptor volume = volume(config, config.pathUri());
         volume.kinds =
                 Arrays.asList(
                         Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH,
@@ -172,5 +184,14 @@ public final class CobblePaths {
         } catch (IOException e) {
             throw new IllegalStateException("Failed to create Cobble directory " + dir, e);
         }
+    }
+
+    private static void localLog(
+            CobbleOptions.CobbleTableConfig options, Config config, String name) {
+        if (isLocal(options.pathUri())) {
+            File root = tableRoot(options);
+            mkdirs(root);
+            config.logPath = new File(root, name).getAbsolutePath();
+        } else config.logPath = null;
     }
 }

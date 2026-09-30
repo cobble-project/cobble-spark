@@ -14,12 +14,14 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Serializes Cobble snapshot commits per table, both within this JVM and across JVMs.
+ * Serializes Cobble writes and commits per table within this JVM, plus OS file locks for local
+ * storage.
  *
  * <p>The driver reads the current snapshot id and materializes {@code id + 1} while holding the
  * lock, so concurrent commit attempts cannot pick the same snapshot id. The JVM-level lock prevents
  * {@link OverlappingFileLockException} between threads of the same process; the file lock guards
- * against other processes on the same table root.
+ * against other processes on the same local table root. Remote roots use only the JVM lock; callers
+ * must ensure one active writer job across processes and engines.
  */
 public final class CobbleCommitLock implements AutoCloseable {
 
@@ -53,12 +55,13 @@ public final class CobbleCommitLock implements AutoCloseable {
 
     private static CobbleCommitLock acquire(String pathUri, String lockFileName)
             throws IOException {
-        Path lockFile = Paths.get(URI.create(pathUri)).resolve(lockFileName);
-        Files.createDirectories(lockFile.getParent());
         ReentrantLock jvmLock = JVM_LOCKS.computeIfAbsent(pathUri, ignored -> new ReentrantLock());
         jvmLock.lock();
         FileChannel channel = null;
         try {
+            if (!CobblePaths.isLocal(pathUri)) return new CobbleCommitLock(jvmLock, null, null);
+            Path lockFile = Paths.get(URI.create(pathUri)).resolve(lockFileName);
+            Files.createDirectories(lockFile.getParent());
             channel =
                     FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
             FileLock fileLock;
@@ -88,10 +91,10 @@ public final class CobbleCommitLock implements AutoCloseable {
     @Override
     public void close() throws IOException {
         try {
-            fileLock.release();
+            if (fileLock != null) fileLock.release();
         } finally {
             try {
-                channel.close();
+                if (channel != null) channel.close();
             } finally {
                 jvmLock.unlock();
             }
