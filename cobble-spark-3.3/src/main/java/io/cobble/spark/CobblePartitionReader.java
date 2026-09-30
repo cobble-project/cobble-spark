@@ -41,6 +41,7 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
     private TableReadProvider<List<Value>, ?> provider;
     private TableReadSession<List<Value>, ?> session;
     private TableReadCursor<List<Value>> cursor;
+    private CobbleHadoopFileSystems.Lease storageLease;
 
     public CobblePartitionReader(
             TableScanPlan plan,
@@ -145,6 +146,7 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
 
     private void openCursor() throws IOException {
         try {
+            storageLease = CobbleHadoopFileSystems.acquire(config);
             provider =
                     plan.open(
                             CobblePaths.createScanConfig(config, sourceSchema.totalBuckets(), 1),
@@ -197,6 +199,10 @@ public final class CobblePartitionReader implements PartitionReader<InternalRow>
             } finally {
                 provider = null;
             }
+        }
+        if (storageLease != null) {
+            storageLease.close();
+            storageLease = null;
         }
         if (failure != null) {
             throw failure;

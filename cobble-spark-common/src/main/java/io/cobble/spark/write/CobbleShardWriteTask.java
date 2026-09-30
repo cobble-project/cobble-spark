@@ -3,6 +3,7 @@ package io.cobble.spark.write;
 import io.cobble.GlobalSnapshot;
 import io.cobble.ShardSnapshot;
 import io.cobble.spark.CobbleBucketMath;
+import io.cobble.spark.CobbleHadoopFileSystems;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
@@ -11,6 +12,7 @@ import io.cobble.spark.CobbleTableRuntime;
 import io.cobble.table.Table;
 import io.cobble.table.Value;
 
+import org.apache.spark.TaskContext;
 import org.apache.spark.sql.Row;
 
 import java.io.IOException;
@@ -36,27 +38,60 @@ public final class CobbleShardWriteTask {
     public static Iterator<CobbleShardResult> writeBuckets(
             int taskIndex, Iterator<Tuple2<Integer, Row>> rows, CobbleWriteContext context)
             throws IOException {
+        TaskContext attempt = TaskContext.get();
+        return writeBucketsAtAttempt(
+                taskIndex,
+                rows,
+                context,
+                attempt == null ? 0 : attempt.attemptNumber(),
+                attempt == null ? 0 : attempt.stageAttemptNumber());
+    }
+
+    static Iterator<CobbleShardResult> writeBucketsAtAttempt(
+            int taskIndex,
+            Iterator<Tuple2<Integer, Row>> rows,
+            CobbleWriteContext context,
+            int taskAttempt,
+            int stageAttempt)
+            throws IOException {
+        validateAttempt(taskAttempt, stageAttempt);
         CobbleLoader.ensureCobbleLoaded();
-        int start =
-                CobbleBucketMath.writerRangeStart(
-                        taskIndex, context.totalBuckets(), context.writerCount());
-        int end =
-                CobbleBucketMath.writerRangeEnd(
-                        taskIndex, context.totalBuckets(), context.writerCount());
-        int count = end - start + 1;
-        int perBucketBuffer = CobblePaths.perBucketWriteBuffer(context.config(), count);
-        Map<Integer, ShardSnapshot> base =
-                baseByBucket(context.baseSnapshot(), context.totalBuckets());
-        CobbleSparkRowConverter converter = new CobbleSparkRowConverter(context.schema());
-        DirectWriteBuffers buffers = new DirectWriteBuffers();
-        if (context.config().isCatalogTable()) {
+        try (CobbleHadoopFileSystems.Lease ignored =
+                CobbleHadoopFileSystems.acquire(context.config())) {
+            int start =
+                    CobbleBucketMath.writerRangeStart(
+                            taskIndex, context.totalBuckets(), context.writerCount());
+            int end =
+                    CobbleBucketMath.writerRangeEnd(
+                            taskIndex, context.totalBuckets(), context.writerCount());
+            int count = end - start + 1;
+            int perBucketBuffer = CobblePaths.perBucketWriteBuffer(context.config(), count);
+            Map<Integer, ShardSnapshot> base =
+                    baseByBucket(context.baseSnapshot(), context.totalBuckets());
+            CobbleSparkRowConverter converter = new CobbleSparkRowConverter(context.schema());
+            DirectWriteBuffers buffers = new DirectWriteBuffers();
+            if (context.config().isCatalogTable()) {
+                return writeOpenedBuckets(
+                        rows,
+                        context,
+                        start,
+                        end,
+                        bucket ->
+                                openCatalogBucket(
+                                        context,
+                                        bucket,
+                                        perBucketBuffer,
+                                        base.get(Integer.valueOf(bucket))),
+                        converter,
+                        buffers);
+            }
             return writeOpenedBuckets(
                     rows,
                     context,
                     start,
                     end,
                     bucket ->
-                            openCatalogBucket(
+                            openPathBucket(
                                     context,
                                     bucket,
                                     perBucketBuffer,
@@ -64,19 +99,6 @@ public final class CobbleShardWriteTask {
                     converter,
                     buffers);
         }
-        return writeOpenedBuckets(
-                rows,
-                context,
-                start,
-                end,
-                bucket ->
-                        openPathBucket(
-                                context,
-                                bucket,
-                                perBucketBuffer,
-                                base.get(Integer.valueOf(bucket))),
-                converter,
-                buffers);
     }
 
     /** Runs the shared row routing/snapshot lifecycle after a mode-specific bucket opener. */
@@ -125,6 +147,13 @@ public final class CobbleShardWriteTask {
         Table open(int bucket);
     }
 
+    static void validateAttempt(int taskAttempt, int stageAttempt) throws IOException {
+        if (taskAttempt != 0 || stageAttempt != 0) {
+            throw new IOException(
+                    "Cobble writers do not support task or stage retries: restart the write job after its original tasks have stopped.");
+        }
+    }
+
     private static Table openPathBucket(
             CobbleWriteContext context, int bucket, int perBucketBuffer, ShardSnapshot source) {
         CobbleOptions.CobbleTableConfig options = context.config();
@@ -152,8 +181,9 @@ public final class CobbleShardWriteTask {
         io.cobble.Config runtime =
                 CobblePaths.createWriterRuntimeConfig(context.totalBuckets(), perBucketBuffer);
         runtime.dataFileType = context.config().dataFileType();
-        io.cobble.Config.VolumeDescriptor primary = new io.cobble.Config.VolumeDescriptor();
-        primary.baseDir = context.config().catalogReference().warehouse();
+        io.cobble.Config.VolumeDescriptor primary =
+                CobblePaths.volume(
+                        context.config(), context.config().catalogReference().warehouse());
         primary.kinds =
                 Collections.singletonList(
                         io.cobble.Config.VolumeUsageKind.PRIMARY_DATA_PRIORITY_HIGH);

@@ -76,6 +76,7 @@ public final class CobbleDataSource
             SaveMode mode,
             scala.collection.immutable.Map<String, String> parameters,
             Dataset<Row> data) {
+        CobbleInsertableRelation.validateSpeculation(sqlContext.sparkContext());
         Map<String, String> options =
                 new HashMap<>(scala.collection.JavaConverters.mapAsJavaMap(parameters));
         CobbleOptions.CobbleTableConfig config = CobbleOptions.parse(options);

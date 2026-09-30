@@ -15,6 +15,19 @@ import java.util.Map;
 class CobbleShardWriteTaskTest {
 
     @Test
+    void retryAndStageRetryFailBeforeReadingContextOrOpeningAnyWriter() {
+        assertThrows(
+                IOException.class,
+                () -> CobbleShardWriteTask.writeBucketsAtAttempt(0, null, null, 1, 0));
+        assertThrows(
+                IOException.class,
+                () -> CobbleShardWriteTask.writeBucketsAtAttempt(0, null, null, 0, 1));
+        assertThrows(
+                IOException.class,
+                () -> CobbleShardWriteTask.writeBucketsAtAttempt(0, null, null, 2, 3));
+    }
+
+    @Test
     void baseRequiresExactlyOneSingleBucketShardPerBucket() throws Exception {
         GlobalSnapshot snapshot = new GlobalSnapshot();
         snapshot.totalBuckets = 8;

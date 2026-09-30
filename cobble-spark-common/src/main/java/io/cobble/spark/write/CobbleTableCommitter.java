@@ -4,6 +4,7 @@ import io.cobble.DbCoordinator;
 import io.cobble.GlobalSnapshot;
 import io.cobble.ShardSnapshot;
 import io.cobble.spark.CobbleCommitLock;
+import io.cobble.spark.CobbleHadoopFileSystems;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
@@ -11,9 +12,7 @@ import io.cobble.table.CatalogTable;
 import io.cobble.table.FileCatalog;
 import io.cobble.table.TableSnapshotCommitter;
 
-import java.io.File;
 import java.io.IOException;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -40,52 +39,55 @@ public final class CobbleTableCommitter {
             List<CobbleShardResult> results,
             GlobalSnapshot baseSnapshot)
             throws IOException {
-        CobbleLoader.ensureCobbleLoaded();
-        if (results.isEmpty()) {
-            throw new IOException("Cobble write produced no writer results.");
-        }
-        int totalBuckets = results.get(0).totalBuckets();
-        for (CobbleShardResult result : results) {
-            if (result.totalBuckets() != totalBuckets) {
-                throw new IOException(
-                        "Mismatched bucket count across Cobble writers: "
-                                + totalBuckets
-                                + " vs "
-                                + result.totalBuckets()
-                                + ".");
+        try (CobbleHadoopFileSystems.Lease storage = CobbleHadoopFileSystems.acquire(config)) {
+            CobbleLoader.ensureCobbleLoaded();
+            if (results.isEmpty()) {
+                throw new IOException("Cobble write produced no writer results.");
             }
-        }
-        validateBucketResults(results, totalBuckets);
-        List<ShardSnapshot> shardSnapshots = new ArrayList<>(results.size());
-        for (CobbleShardResult result : results) {
-            shardSnapshots.add(result.shardSnapshot());
-        }
-        String lockScope = lockScope(config);
-        try (CobbleCommitLock ignored = CobbleCommitLock.acquire(lockScope)) {
-            if (config.isCatalogTable()) {
-                return commitCatalog(config, totalBuckets, shardSnapshots, baseSnapshot);
+            int totalBuckets = results.get(0).totalBuckets();
+            for (CobbleShardResult result : results) {
+                if (result.totalBuckets() != totalBuckets) {
+                    throw new IOException(
+                            "Mismatched bucket count across Cobble writers: "
+                                    + totalBuckets
+                                    + " vs "
+                                    + result.totalBuckets()
+                                    + ".");
+                }
             }
-            GlobalSnapshot latest;
-            try (DbCoordinator coordinator =
-                    DbCoordinator.open(CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
-                latest = coordinator.loadCurrentGlobalSnapshot();
+            validateBucketResults(results, totalBuckets);
+            List<ShardSnapshot> shardSnapshots = new ArrayList<>(results.size());
+            for (CobbleShardResult result : results) {
+                shardSnapshots.add(result.shardSnapshot());
             }
-            requireBase(config, latest, baseSnapshot);
+            String lockScope = lockScope(config);
+            try (CobbleCommitLock ignored = CobbleCommitLock.acquire(lockScope)) {
+                if (config.isCatalogTable()) {
+                    return commitCatalog(config, totalBuckets, shardSnapshots, baseSnapshot);
+                }
+                GlobalSnapshot latest;
+                try (DbCoordinator coordinator =
+                        DbCoordinator.open(
+                                CobblePaths.createCoordinatorConfig(config, totalBuckets))) {
+                    latest = coordinator.loadCurrentGlobalSnapshot();
+                }
+                requireBase(config, latest, baseSnapshot);
 
-            long commitId = latest == null ? 0L : latest.id + 1L;
-            GlobalSnapshot materialized;
-            try (TableSnapshotCommitter committer =
-                    TableSnapshotCommitter.open(
-                            CobblePaths.createCoordinatorConfig(config, totalBuckets),
-                            totalBuckets,
-                            1)) {
-                materialized = committer.commitBatch(commitId, shardSnapshots);
-            }
-            if (materialized == null) {
-                throw new IOException("Cobble table commit was unexpectedly superseded.");
-            }
+                long commitId = latest == null ? 0L : latest.id + 1L;
+                GlobalSnapshot materialized;
+                try (TableSnapshotCommitter committer =
+                        TableSnapshotCommitter.open(
+                                CobblePaths.createCoordinatorConfig(config, totalBuckets),
+                                totalBuckets,
+                                1)) {
+                    materialized = committer.commitBatch(commitId, shardSnapshots);
+                }
+                if (materialized == null) {
+                    throw new IOException("Cobble table commit was unexpectedly superseded.");
+                }
 
-            return materialized;
+                return materialized;
+            }
         }
     }
 
@@ -96,15 +98,13 @@ public final class CobbleTableCommitter {
     private static String catalogLockScope(CobbleOptions.CobbleTableConfig config)
             throws IOException {
         io.cobble.spark.CobbleCatalogReference reference = config.catalogReference();
-        File root = new File(URI.create(reference.warehouse()));
-        File lockDir =
-                new File(
-                        new File(root, ".spark-cobble-locks"),
-                        reference.storageId() + "-TABLE-" + reference.tableId());
-        if (!lockDir.isDirectory() && !lockDir.mkdirs()) {
-            throw new IOException("Failed to create Spark catalog lock directory " + lockDir);
-        }
-        return lockDir.toURI().toString();
+        String warehouse = reference.warehouse();
+        return warehouse
+                + (warehouse.endsWith("/") ? "" : "/")
+                + ".spark-cobble-locks/"
+                + reference.storageId()
+                + "-TABLE-"
+                + reference.tableId();
     }
 
     /** Enforces the physical one-database-per-bucket contract before publishing any metadata. */
@@ -161,8 +161,7 @@ public final class CobbleTableCommitter {
         io.cobble.spark.CobbleCatalogReference reference = config.catalogReference();
         try (FileCatalog catalog =
                         FileCatalog.open(
-                                new io.cobble.Config().addVolume(reference.warehouse()),
-                                reference.storageId());
+                                CobblePaths.createCatalogConfig(config), reference.storageId());
                 CatalogTable table = catalog.loadTable(reference.identifier())) {
             reference.validate(table);
             GlobalSnapshot latest;

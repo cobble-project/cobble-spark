@@ -3,6 +3,7 @@ package io.cobble.spark.write;
 import io.cobble.GlobalSnapshot;
 import io.cobble.spark.CobbleBucketMath;
 import io.cobble.spark.CobbleCommitLock;
+import io.cobble.spark.CobbleHadoopFileSystems;
 import io.cobble.spark.CobbleLoader;
 import io.cobble.spark.CobbleOptions;
 import io.cobble.spark.CobblePaths;
@@ -52,11 +53,13 @@ public final class CobbleInsertableRelation implements InsertableRelation {
 
     @Override
     public void insert(Dataset<Row> data, boolean overwrite) {
+        validateSpeculation(data.sparkSession().sparkContext());
         CobbleLoader.ensureCobbleLoaded();
         boolean overwriteAll = overwrite || this.overwrite;
 
-        try (CobbleCommitLock ignored =
-                CobbleCommitLock.acquireWrite(CobbleTableCommitter.lockScope(config))) {
+        try (CobbleHadoopFileSystems.Lease storage = CobbleHadoopFileSystems.acquire(config);
+                CobbleCommitLock ignored =
+                        CobbleCommitLock.acquireWrite(CobbleTableCommitter.lockScope(config))) {
 
             GlobalSnapshot currentSnapshot = loadCurrentGlobalSnapshot(config);
             CobbleTableSchema schema;
@@ -195,6 +198,13 @@ public final class CobbleInsertableRelation implements InsertableRelation {
             if (coordinator != null) {
                 coordinator.close();
             }
+        }
+    }
+
+    public static void validateSpeculation(org.apache.spark.SparkContext context) {
+        if (context.getConf().getBoolean("spark.speculation", false)) {
+            throw new IllegalArgumentException(
+                    "Cobble writes require spark.speculation=false because writer tasks share in-place bucket state.");
         }
     }
 

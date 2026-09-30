@@ -17,33 +17,38 @@ public final class CobbleTableRuntime {
     private CobbleTableRuntime() {}
 
     public static GlobalSnapshot loadSnapshot(CobbleOptions.CobbleTableConfig config) {
-        CobbleLoader.ensureCobbleLoaded();
-        if (config.isCatalogTable()) {
-            CobbleCatalogReference reference = config.catalogReference();
-            try (FileCatalog catalog =
-                            FileCatalog.open(catalogConfig(reference), reference.storageId());
-                    CatalogTable table = catalog.loadTable(reference.identifier());
-                    DbCoordinator coordinator = table.coordinator(runtimeConfig(config, null))) {
-                if (config.hasSnapshotId()) {
-                    reference.validateTable(table);
-                } else {
-                    reference.validate(table);
+        try (CobbleHadoopFileSystems.Lease ignored = CobbleHadoopFileSystems.acquire(config)) {
+            CobbleLoader.ensureCobbleLoaded();
+            if (config.isCatalogTable()) {
+                CobbleCatalogReference reference = config.catalogReference();
+                try (FileCatalog catalog =
+                                FileCatalog.open(
+                                        CobblePaths.createCatalogConfig(config),
+                                        reference.storageId());
+                        CatalogTable table = catalog.loadTable(reference.identifier());
+                        DbCoordinator coordinator =
+                                table.coordinator(runtimeConfig(config, null))) {
+                    if (config.hasSnapshotId()) {
+                        reference.validateTable(table);
+                    } else {
+                        reference.validate(table);
+                    }
+                    return config.hasSnapshotId()
+                            ? coordinator.getGlobalSnapshot(config.snapshotId())
+                            : coordinator.loadCurrentGlobalSnapshot();
                 }
+            }
+            try (DbCoordinator coordinator =
+                    DbCoordinator.open(
+                            CobblePaths.createCoordinatorConfig(
+                                    config,
+                                    config.hasBucketCount()
+                                            ? Integer.valueOf(config.bucketCount())
+                                            : null))) {
                 return config.hasSnapshotId()
                         ? coordinator.getGlobalSnapshot(config.snapshotId())
                         : coordinator.loadCurrentGlobalSnapshot();
             }
-        }
-        try (DbCoordinator coordinator =
-                DbCoordinator.open(
-                        CobblePaths.createCoordinatorConfig(
-                                config,
-                                config.hasBucketCount()
-                                        ? Integer.valueOf(config.bucketCount())
-                                        : null))) {
-            return config.hasSnapshotId()
-                    ? coordinator.getGlobalSnapshot(config.snapshotId())
-                    : coordinator.loadCurrentGlobalSnapshot();
         }
     }
 
@@ -54,16 +59,20 @@ public final class CobbleTableRuntime {
     /** Captures the validated catalog definition on the driver for portable bucket writers. */
     public static TableWritePlan buildWritePlan(
             CobbleOptions.CobbleTableConfig config, int totalBuckets) {
-        if (!config.isCatalogTable()) {
-            throw new IllegalArgumentException("A catalog table is required for a write plan.");
-        }
-        CobbleLoader.ensureCobbleLoaded();
-        CobbleCatalogReference reference = config.catalogReference();
-        try (FileCatalog catalog =
-                        FileCatalog.open(catalogConfig(reference), reference.storageId());
-                CatalogTable table = catalog.loadTable(reference.identifier())) {
-            reference.validate(table);
-            return table.newWriteBuilder().totalBuckets(totalBuckets).build();
+        try (CobbleHadoopFileSystems.Lease ignored = CobbleHadoopFileSystems.acquire(config)) {
+            if (!config.isCatalogTable()) {
+                throw new IllegalArgumentException("A catalog table is required for a write plan.");
+            }
+            CobbleLoader.ensureCobbleLoaded();
+            CobbleCatalogReference reference = config.catalogReference();
+            try (FileCatalog catalog =
+                            FileCatalog.open(
+                                    CobblePaths.createCatalogConfig(config),
+                                    reference.storageId());
+                    CatalogTable table = catalog.loadTable(reference.identifier())) {
+                reference.validate(table);
+                return table.newWriteBuilder().totalBuckets(totalBuckets).build();
+            }
         }
     }
 
@@ -78,72 +87,80 @@ public final class CobbleTableRuntime {
 
     /** Resolves a generic path before assuming that it has a native global manifest. */
     public static TableScanPlan resolveReadPlan(CobbleOptions.CobbleTableConfig config) {
-        CobbleLoader.ensureCobbleLoaded();
-        if (config.isCatalogTable()) {
-            GlobalSnapshot snapshot = loadSnapshot(config);
-            if (snapshot == null) {
-                throw new IllegalArgumentException(
-                        "Cobble catalog table has no committed snapshot: " + config.pathUri());
+        try (CobbleHadoopFileSystems.Lease ignored = CobbleHadoopFileSystems.acquire(config)) {
+            CobbleLoader.ensureCobbleLoaded();
+            if (config.isCatalogTable()) {
+                GlobalSnapshot snapshot = loadSnapshot(config);
+                if (snapshot == null) {
+                    throw new IllegalArgumentException(
+                            "Cobble catalog table has no committed snapshot: " + config.pathUri());
+                }
+                return loadReadPlan(config, snapshot);
             }
-            return loadReadPlan(config, snapshot);
-        }
-        int buckets = config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
-        Config readConfig = runtimeConfig(config, Integer.valueOf(buckets));
-        try (TableReader reader =
-                TableReader.open(
-                        readConfig,
-                        new TablePathRequest(
-                                config.pathUri(),
-                                config.tableName(),
-                                config.hasSnapshotId() ? Long.valueOf(config.snapshotId()) : null,
-                                config.resolverOptions()))) {
-            return reader.scanPlan();
-        } catch (RuntimeException error) {
-            throw error;
-        } catch (Exception error) {
-            throw new IllegalStateException("Failed to open fixed Cobble table reader.", error);
+            int buckets =
+                    config.hasBucketCount() ? config.bucketCount() : CobbleOptions.DEFAULT_BUCKET;
+            Config readConfig = runtimeConfig(config, Integer.valueOf(buckets));
+            try (TableReader reader =
+                    TableReader.open(
+                            readConfig,
+                            new TablePathRequest(
+                                    config.pathUri(),
+                                    config.tableName(),
+                                    config.hasSnapshotId()
+                                            ? Long.valueOf(config.snapshotId())
+                                            : null,
+                                    config.resolverOptions()))) {
+                return reader.scanPlan();
+            } catch (RuntimeException error) {
+                throw error;
+            } catch (Exception error) {
+                throw new IllegalStateException("Failed to open fixed Cobble table reader.", error);
+            }
         }
     }
 
     /** Resolves the captured format id and creates a generic fixed-snapshot read plan. */
     public static TableScanPlan loadReadPlan(
             CobbleOptions.CobbleTableConfig config, GlobalSnapshot snapshot) {
-        if (snapshot == null) {
-            throw new IllegalArgumentException(
-                    "Cobble table " + config.pathUri() + " has no committed snapshot.");
-        }
-        CobbleLoader.ensureCobbleLoaded();
-        Config readConfig = runtimeConfig(config, snapshot.totalBuckets);
-        try {
-            if (config.isCatalogTable()) {
-                CobbleCatalogReference reference = config.catalogReference();
-                try (FileCatalog catalog =
-                                FileCatalog.open(catalogConfig(reference), reference.storageId());
-                        CatalogTable table = catalog.loadTable(reference.identifier())) {
-                    if (config.hasSnapshotId()) reference.validateTable(table);
-                    else reference.validate(table);
-                    try (TableReader reader =
-                            table.readerBuilder(readConfig).globalSnapshot(snapshot.id).open()) {
-                        return reader.scanPlan();
+        try (CobbleHadoopFileSystems.Lease ignored = CobbleHadoopFileSystems.acquire(config)) {
+            if (snapshot == null) {
+                throw new IllegalArgumentException(
+                        "Cobble table " + config.pathUri() + " has no committed snapshot.");
+            }
+            CobbleLoader.ensureCobbleLoaded();
+            Config readConfig = runtimeConfig(config, snapshot.totalBuckets);
+            try {
+                if (config.isCatalogTable()) {
+                    CobbleCatalogReference reference = config.catalogReference();
+                    try (FileCatalog catalog =
+                                    FileCatalog.open(
+                                            CobblePaths.createCatalogConfig(config),
+                                            reference.storageId());
+                            CatalogTable table = catalog.loadTable(reference.identifier())) {
+                        if (config.hasSnapshotId()) reference.validateTable(table);
+                        else reference.validate(table);
+                        try (TableReader reader =
+                                table.readerBuilder(readConfig)
+                                        .globalSnapshot(snapshot.id)
+                                        .open()) {
+                            return reader.scanPlan();
+                        }
                     }
                 }
+                try (TableReader reader =
+                        TableReader.open(readConfig, config.tableName(), snapshot.id)) {
+                    return reader.scanPlan();
+                }
+            } catch (RuntimeException error) {
+                throw new IllegalStateException(
+                        "Failed to plan fixed Cobble snapshot read.", error);
             }
-            try (TableReader reader =
-                    TableReader.open(readConfig, config.tableName(), snapshot.id)) {
-                return reader.scanPlan();
-            }
-        } catch (RuntimeException error) {
-            throw new IllegalStateException("Failed to plan fixed Cobble snapshot read.", error);
         }
     }
 
     public static boolean isNativeFormat(
             CobbleOptions.CobbleTableConfig config, GlobalSnapshot snapshot) {
         return snapshot == null || "cobble-table".equals(loadReadPlan(config, snapshot).formatId());
-    }
-
-    private static Config catalogConfig(CobbleCatalogReference reference) {
-        return new Config().addVolume(reference.warehouse());
     }
 
     private static Config runtimeConfig(
