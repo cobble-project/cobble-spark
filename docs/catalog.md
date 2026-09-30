@@ -19,10 +19,10 @@ spark.sql.catalog.cobble.write.buffer-memory=32mb
 spark.sql.catalog.cobble.data.file-type=parquet
 ```
 
-`warehouse` is an alias for `path`. The current connector supports local
-filesystem paths, which must refer to the same shared storage on every driver
-and executor. `storage-id` selects the native catalog storage namespace; its
-Spark default is `cobble`.
+`warehouse` is an alias for `path`. Local paths must refer to the same storage on
+every driver and executor. Native S3 and Hadoop filesystem storage are also supported;
+see [remote storage](remote-storage.md). `storage-id` selects the native catalog
+storage namespace; its Spark default is `cobble`.
 
 Runtime settings belong on the catalog, not in persistent table properties.
 The configured bucket count applies to the first write; later writes use the
@@ -46,10 +46,12 @@ default to Parquet; set `data.file-type=sst` to select Cobble's SST format.
 These are Cobble-managed storage files, not a standalone Spark Parquet dataset.
 Native filenames can still end in `.sst`; the manifest records the actual format.
 This is a memtable budget, not a bound on all JVM/native memory.
-Each write attempt resumes the same database at its assigned committed snapshot,
-not the latest local snapshot left by an unfinished attempt. An empty baseline
-snapshot is retained for initial-write retries and overwrite. Historical snapshots
-remain readable, and subsequent file and snapshot identifiers do not rewind.
+Each write job resumes the same database at its assigned committed snapshot.
+Speculative writes and automatic writer task/stage retries are rejected because
+bucket state is updated in place. Restart a failed job only after its original
+tasks have stopped. An empty baseline is retained for restarted initial writes
+and overwrite. Historical snapshots remain readable, and subsequent file and
+snapshot identifiers do not rewind.
 
 Unknown runtime options are rejected. All Spark writes currently require
 `snapshot.retention=0` (the default), including standalone path-mode tables.
@@ -146,9 +148,8 @@ both connectors can read snapshots containing both file formats.
 
 ## Operational boundaries
 
-- Fixed-identity bucket writers require local/shared filesystem metadata storage
-  with working OS file locks. The bucket lock covers the database lifetime;
-  object-store distributed fencing is not implemented by this writer mode.
+- Local storage uses OS file locks. Remote storage uses process-level coordination
+  only; object-store distributed fencing is not implemented by this writer mode.
 - Use one active writer across engines. Spark's write lock, commit lock and expected-base
   check coordinate Spark writes, but do not constitute a shared Spark/Flink
   transaction protocol. Perform schema changes, renames and drops while writers
