@@ -671,6 +671,129 @@ public class CobbleSparkReadWriteTest {
     }
 
     @Test
+    public void scanBuilderKeepsCompleteNestedTypesWhenPruningColumns() {
+        StructType profile =
+                new StructType()
+                        .add("left", DataTypes.IntegerType)
+                        .add("right", DataTypes.IntegerType);
+        StructType full =
+                new StructType()
+                        .add("id", DataTypes.IntegerType, false)
+                        .add("profile", profile)
+                        .add("unused", DataTypes.StringType);
+        CobbleTableSchema tableSchema =
+                CobbleTableSchema.fromStructType(full, Collections.singletonList("id"), 1);
+        CobbleOptions.CobbleTableConfig config =
+                CobbleOptions.parse(Collections.singletonMap("path", tableDir.toUri().toString()));
+        CobbleScanBuilder builder = new CobbleScanBuilder(config, tableSchema, tableSchema, null);
+        builder.pruneColumns(
+                new StructType()
+                        .add("profile", new StructType().add("right", DataTypes.IntegerType))
+                        .add("id", DataTypes.IntegerType));
+        assertEquals(
+                new StructType(
+                        new org.apache.spark.sql.types.StructField[] {
+                            full.fields()[1], full.fields()[0]
+                        }),
+                builder.build().readSchema());
+        builder.pruneColumns(new StructType());
+        assertEquals(new StructType(), builder.build().readSchema());
+    }
+
+    @Test
+    public void nestedFieldProjectionPreservesPositionsAndNulls() {
+        StructType pair =
+                new StructType()
+                        .add("left", DataTypes.IntegerType)
+                        .add("right", DataTypes.IntegerType);
+        StructType profile =
+                pair.add(
+                        "detail",
+                        new StructType()
+                                .add("first", DataTypes.StringType)
+                                .add("last", DataTypes.StringType));
+        StructType nestedSchema =
+                new StructType()
+                        .add("id", DataTypes.IntegerType, false)
+                        .add("profile", profile)
+                        .add("items", DataTypes.createArrayType(pair, true))
+                        .add("attrs", DataTypes.createMapType(DataTypes.StringType, pair, true))
+                        .add("unused", DataTypes.StringType);
+        spark.createDataFrame(
+                        Arrays.asList(
+                                RowFactory.create(
+                                        1,
+                                        RowFactory.create(
+                                                11, 22, RowFactory.create("first", "last")),
+                                        Arrays.asList(
+                                                RowFactory.create(31, 32),
+                                                null,
+                                                RowFactory.create(41, 42)),
+                                        Collections.singletonMap("k", RowFactory.create(51, 52)),
+                                        "not requested"),
+                                RowFactory.create(2, null, null, null, null),
+                                RowFactory.create(
+                                        3,
+                                        RowFactory.create(null, 23, null),
+                                        Collections.emptyList(),
+                                        Collections.emptyMap(),
+                                        "unused")),
+                        nestedSchema)
+                .write()
+                .format("cobble")
+                .option("primary-key", "id")
+                .option("bucket", "1")
+                .save(tableDir.toUri().toString());
+
+        String setting = "spark.sql.optimizer.nestedSchemaPruning.enabled";
+        String previous = spark.conf().get(setting);
+        try {
+            for (boolean prune : new boolean[] {true, false}) {
+                spark.conf().set(setting, Boolean.toString(prune));
+                assertEquals(
+                        Arrays.asList(
+                                RowFactory.create(11),
+                                RowFactory.create((Object) null),
+                                RowFactory.create((Object) null)),
+                        spark.read()
+                                .format("cobble")
+                                .load(tableDir.toUri().toString())
+                                .orderBy("id")
+                                .selectExpr("profile.left")
+                                .collectAsList());
+                assertEquals(
+                        Arrays.asList(
+                                RowFactory.create(22),
+                                RowFactory.create((Object) null),
+                                RowFactory.create(23)),
+                        spark.read()
+                                .format("cobble")
+                                .load(tableDir.toUri().toString())
+                                .orderBy("id")
+                                .selectExpr("profile.right")
+                                .collectAsList());
+                List<Row> result =
+                        spark.read()
+                                .format("cobble")
+                                .load(tableDir.toUri().toString())
+                                .orderBy("id")
+                                .selectExpr(
+                                        "profile.detail.last", "items.right", "attrs['k'].right")
+                                .collectAsList();
+                assertEquals("last", result.get(0).getString(0));
+                assertEquals(Arrays.asList(32, null, 42), result.get(0).getList(1));
+                assertEquals(52, result.get(0).getInt(2));
+                assertEquals(RowFactory.create(null, null, null), result.get(1));
+                assertTrue(result.get(2).isNullAt(0));
+                assertTrue(result.get(2).getList(1).isEmpty());
+                assertTrue(result.get(2).isNullAt(2));
+            }
+        } finally {
+            spark.conf().set(setting, previous);
+        }
+    }
+
+    @Test
     public void nestedTypesRoundTripThroughNativeCodecs() {
         StructType nestedSchema =
                 DataTypes.createStructType(

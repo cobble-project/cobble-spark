@@ -5,6 +5,7 @@ import io.cobble.table.TableScanPlan;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /** Scan builder resolving the scan snapshot and applying column pruning. */
@@ -30,9 +31,13 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
 
     @Override
     public void pruneColumns(StructType requiredSchema) {
-        for (org.apache.spark.sql.types.StructField field : requiredSchema.fields()) {
+        StructField[] requested = requiredSchema.fields();
+        StructField[] targetFields = targetSchema.toStructType().fields();
+        StructField[] readFields = new StructField[requested.length];
+        for (int i = 0; i < requested.length; i++) {
+            StructField field = requested[i];
             try {
-                targetSchema.ordinalOf(field.name());
+                readFields[i] = targetFields[targetSchema.ordinalOf(field.name())];
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException(
                         "Column '"
@@ -43,7 +48,9 @@ public final class CobbleScanBuilder implements ScanBuilder, SupportsPushDownReq
                         e);
             }
         }
-        this.requiredSchema = requiredSchema;
+        // Native projection selects top-level fields. Report their complete types so Spark
+        // extracts nested fields itself, rather than treating pruning as a schema cast.
+        this.requiredSchema = new StructType(readFields);
     }
 
     @Override
