@@ -47,6 +47,10 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
                 : config.pathUri();
     }
 
+    CobbleOptions.CobbleTableConfig config() {
+        return config;
+    }
+
     @Override
     public StructType schema() {
         if (!config.isCatalogTable()) {
@@ -63,7 +67,7 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
             }
         }
         io.cobble.GlobalSnapshot snapshot = CobbleTableRuntime.loadSnapshot(config);
-        if (config.isCatalogTable() && !config.hasSnapshotId()) {
+        if (!config.hasSnapshotId()) {
             // The catalog descriptor is the latest requested schema. A snapshot deliberately
             // carries its own schema instead, so time travel remains self-describing.
             return CobbleTableSchema.fromTableSchema(
@@ -75,14 +79,11 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
                                     : snapshot.totalBuckets)
                     .toStructType();
         }
-        if (snapshot != null) return CobbleTableRuntime.loadSchema(config, snapshot).toStructType();
-        if (providedSchema != null) {
-            return providedSchema;
+        if (snapshot == null) {
+            throw new IllegalArgumentException(
+                    "Cobble table has no snapshot " + config.snapshotId() + ".");
         }
-        throw new IllegalArgumentException(
-                "Cobble table "
-                        + config.pathUri()
-                        + " does not exist yet; write it first or pass a schema when creating it.");
+        return CobbleTableRuntime.loadSchema(config, snapshot).toStructType();
     }
 
     @Override
@@ -102,6 +103,13 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
     @Override
     public ScanBuilder newScanBuilder(CaseInsensitiveStringMap options) {
         CobbleOptions.CobbleTableConfig scanConfig = operationConfig(options.asCaseSensitiveMap());
+        if (config.isCatalogTable()
+                && (config.hasSnapshotId() != scanConfig.hasSnapshotId()
+                        || (config.hasSnapshotId()
+                                && config.snapshotId() != scanConfig.snapshotId()))) {
+            throw new IllegalArgumentException(
+                    "Catalog snapshot-id must match the snapshot bound during table analysis. Load the connector jar before creating SparkSession and select the snapshot with spark.read.option(\"snapshot-id\", id).table(name).");
+        }
         CobbleTableSchema sourceSchema;
         CobbleTableSchema targetSchema;
         TableScanPlan scanPlan = null;
@@ -141,7 +149,7 @@ public final class CobbleTable implements SupportsRead, SupportsWrite {
     public WriteBuilder newWriteBuilder(LogicalWriteInfo info) {
         CobbleOptions.CobbleTableConfig writeConfig =
                 operationConfig(info.options().asCaseSensitiveMap());
-        if (writeConfig.hasSnapshotId()) {
+        if (config.hasSnapshotId() || writeConfig.hasSnapshotId()) {
             throw new UnsupportedOperationException(
                     "Writing a snapshot-id Cobble table is not supported.");
         }

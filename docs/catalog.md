@@ -99,6 +99,15 @@ Numeric snapshot versions through Spark's versioned catalog API and the
 `snapshot-id` read option use the snapshot's own schema and are read-only;
 timestamp-based version lookup is not implemented.
 
+For catalog reads, use `spark.read.option("snapshot-id", "0").table("cobble.db.t")`.
+The connector automatically registers a Spark analysis rule that binds the
+historical schema before this call returns, so subsequent projections, filters,
+joins and temporary views use that schema. Load the connector jar before creating
+`SparkSession`. The rule only binds this standalone reader relation; it does not
+rewrite snapshot options on relations embedded in arbitrary logical plans.
+An empty selector or `latest` retains the latest schema and data; invalid or
+missing numeric snapshots fail instead of falling back to latest.
+
 Timestamp interoperability currently supports Cobble's local-time-zone timestamp
 with precision up to microseconds. No-time-zone timestamps and higher precision
 are rejected rather than implicitly converted or truncated.

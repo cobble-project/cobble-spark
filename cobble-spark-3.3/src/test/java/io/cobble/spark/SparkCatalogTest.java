@@ -23,12 +23,17 @@ import io.cobble.table.TableIdentifier;
 import io.cobble.table.TableSchema;
 import io.cobble.table.TableWritePlan;
 
+import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
+import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableChange;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
@@ -78,6 +83,189 @@ public class SparkCatalogTest {
         if (spark != null) {
             spark.stop();
         }
+    }
+
+    @Test
+    public void snapshotOptionBindsHistoricalSchemaBeforeRenamedColumnsAreResolved() {
+        spark.sql("CREATE NAMESPACE cobble.snapshot_option_rename");
+        spark.sql(
+                "CREATE TABLE cobble.snapshot_option_rename.t (id BIGINT, label STRING, n INT) "
+                        + "USING cobble OPTIONS ('primary-key'='id')");
+        spark.sql(
+                "INSERT INTO cobble.snapshot_option_rename.t VALUES (1, 'one', 7), (2, 'two', 9)");
+        spark.sql("ALTER TABLE cobble.snapshot_option_rename.t RENAME COLUMN label TO title");
+
+        Dataset<Row> historical =
+                spark.read().option("snapshot-id", "0").table("cobble.snapshot_option_rename.t");
+        assertEquals(
+                Arrays.asList("id", "label", "n"), Arrays.asList(historical.schema().fieldNames()));
+        assertEquals(
+                Arrays.asList(RowFactory.create(1L, "one", 7), RowFactory.create(2L, "two", 9)),
+                historical.orderBy("id").collectAsList());
+        assertEquals(
+                Arrays.asList("id", "title", "n"),
+                Arrays.asList(
+                        spark.table("cobble.snapshot_option_rename.t").schema().fieldNames()));
+    }
+
+    @Test
+    public void snapshotOptionKeepsEvolvedSchemasDataAndCachedRelationsSeparate() {
+        String name = "cobble.snapshot_option_evolve.t";
+        spark.sql("CREATE NAMESPACE cobble.snapshot_option_evolve");
+        spark.sql(
+                "CREATE TABLE "
+                        + name
+                        + " (id INT, label STRING, n INT, retired STRING) "
+                        + "USING cobble OPTIONS ('primary-key'='id')");
+        spark.sql(
+                "INSERT INTO "
+                        + name
+                        + " VALUES (1, 'one', 7, 'old-one'), (2, 'two', 9, 'old-two')");
+        spark.sql("ALTER TABLE " + name + " ADD COLUMNS (extra STRING)");
+        spark.sql("ALTER TABLE " + name + " RENAME COLUMN label TO title");
+        spark.sql("ALTER TABLE " + name + " ALTER COLUMN n TYPE BIGINT");
+        spark.sql("ALTER TABLE " + name + " DROP COLUMN retired");
+        spark.sql(
+                "INSERT INTO "
+                        + name
+                        + " VALUES (1, 'changed', 70L, 'new-one'), (3, 'three', 11L, 'new-three')");
+
+        Dataset<Row> historical = spark.read().option("SNAPSHOT-ID", " 0 ").table(name).cache();
+        Dataset<Row> latest = spark.table(name).cache();
+        try {
+            assertEquals(
+                    Arrays.asList("id", "label", "n", "retired"),
+                    Arrays.asList(historical.schema().fieldNames()));
+            assertEquals(DataTypes.IntegerType, historical.schema().apply("n").dataType());
+            assertEquals(
+                    Arrays.asList(
+                            RowFactory.create(1, "one", 7, "old-one"),
+                            RowFactory.create(2, "two", 9, "old-two")),
+                    historical.orderBy("id").collectAsList());
+            assertEquals(
+                    Arrays.asList("id", "title", "n", "extra"),
+                    Arrays.asList(latest.schema().fieldNames()));
+            assertEquals(DataTypes.LongType, latest.schema().apply("n").dataType());
+            List<Row> latestRows =
+                    Arrays.asList(
+                            RowFactory.create(1, "changed", 70L, "new-one"),
+                            RowFactory.create(2, "two", 9L, null),
+                            RowFactory.create(3, "three", 11L, "new-three"));
+            assertEquals(latestRows, latest.orderBy("id").collectAsList());
+            assertEquals(
+                    latestRows,
+                    spark.read()
+                            .option("snapshot-id", "latest")
+                            .table(name)
+                            .orderBy("id")
+                            .collectAsList());
+            assertEquals(
+                    latestRows,
+                    spark.read()
+                            .option("snapshot-id", "")
+                            .table(name)
+                            .orderBy("id")
+                            .collectAsList());
+            assertEquals(
+                    latestRows,
+                    spark.read()
+                            .option("snapshot-id", "1")
+                            .table(name)
+                            .orderBy("id")
+                            .collectAsList());
+            assertEquals(
+                    Collections.singletonList(RowFactory.create("one")),
+                    historical.filter("n = 7").select("label").collectAsList());
+            assertEquals(
+                    Arrays.asList(
+                            RowFactory.create("one", "changed"), RowFactory.create("two", "two")),
+                    historical
+                            .alias("h")
+                            .join(
+                                    latest.alias("l"),
+                                    functions.col("h.id").equalTo(functions.col("l.id")))
+                            .orderBy(functions.col("h.id"))
+                            .select("h.label", "l.title")
+                            .collectAsList());
+            historical.createOrReplaceTempView("snapshot_option_view");
+            assertEquals(
+                    Collections.singletonList(RowFactory.create("one")),
+                    spark.sql("SELECT label FROM snapshot_option_view WHERE n = 7")
+                            .collectAsList());
+            LogicalPlan analyzed = historical.queryExecution().analyzed();
+            assertTrue(
+                    new CobbleSparkSessionExtensions.BindCatalogSnapshot().apply(analyzed)
+                            == analyzed);
+            LogicalPlan projected = latest.select("id").queryExecution().analyzed();
+            assertTrue(
+                    new CobbleSparkSessionExtensions.BindCatalogSnapshot().apply(projected)
+                            == projected);
+        } finally {
+            historical.unpersist();
+            latest.unpersist();
+            spark.catalog().dropTempView("snapshot_option_view");
+        }
+    }
+
+    @Test
+    public void snapshotOptionsRejectInvalidIdsMissingSnapshotsAndUnboundOrConflictingScans()
+            throws Exception {
+        String name = "cobble.snapshot_option_errors.t";
+        spark.sql("CREATE NAMESPACE cobble.snapshot_option_errors");
+        spark.sql(
+                "CREATE TABLE "
+                        + name
+                        + " (id INT, v STRING) USING cobble OPTIONS ('primary-key'='id')");
+        spark.sql("INSERT INTO " + name + " VALUES (1, 'one')");
+        for (String value : Arrays.asList("not-a-number", "-1")) {
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> spark.read().option("snapshot-id", value).table(name));
+        }
+        IllegalStateException missing =
+                assertThrows(
+                        IllegalStateException.class,
+                        () -> spark.read().option("snapshot-id", "999999").table(name));
+        assertTrue(missing.getMessage().contains("SNAPSHOT-999999"));
+        Dataset<Row> historical = spark.read().option("snapshot-id", "0").table(name);
+        LogicalPlan analyzed = historical.queryExecution().analyzed();
+        while (analyzed instanceof SubqueryAlias) analyzed = ((SubqueryAlias) analyzed).child();
+        CobbleTable bound = (CobbleTable) ((DataSourceV2Relation) analyzed).table();
+        assertEquals(
+                Collections.singleton(
+                        org.apache.spark.sql.connector.catalog.TableCapability.BATCH_READ),
+                bound.capabilities());
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> bound.newWriteBuilder(logicalWriteInfo()));
+        for (String value : Arrays.asList("1", "latest", "")) {
+            assertThrows(
+                    UnsupportedOperationException.class,
+                    () ->
+                            bound.newWriteBuilder(
+                                    logicalWriteInfo(
+                                            Collections.singletonMap("snapshot-id", value))));
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () ->
+                            bound.newScanBuilder(
+                                    new CaseInsensitiveStringMap(
+                                            Collections.singletonMap("snapshot-id", value))));
+        }
+        CobbleTable unbound =
+                (CobbleTable)
+                        directCatalog()
+                                .loadTable(
+                                        Identifier.of(
+                                                new String[] {"snapshot_option_errors"}, "t"));
+        IllegalArgumentException error =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                unbound.newScanBuilder(
+                                        new CaseInsensitiveStringMap(
+                                                Collections.singletonMap("snapshot-id", "0"))));
+        assertTrue(error.getMessage().contains("bound during table analysis"));
     }
 
     @Test
@@ -633,10 +821,14 @@ public class SparkCatalogTest {
     }
 
     private static LogicalWriteInfo logicalWriteInfo() {
+        return logicalWriteInfo(Collections.emptyMap());
+    }
+
+    private static LogicalWriteInfo logicalWriteInfo(Map<String, String> options) {
         return new LogicalWriteInfo() {
             @Override
             public CaseInsensitiveStringMap options() {
-                return new CaseInsensitiveStringMap(Collections.emptyMap());
+                return new CaseInsensitiveStringMap(options);
             }
 
             @Override
